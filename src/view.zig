@@ -292,7 +292,7 @@ pub const Maps = struct {
             };
             const j_ptr = a.create(Jump) catch continue;
             j_ptr.* = .{ .s = state, .c = cont };
-            chips.append(a, cx.make(ui.OutlinedButton{
+            chips.append(a, cx.make(ui.Chip{
                 .label = cont.name,
                 .on_press = .of(j_ptr, Jump.call),
             })) catch {};
@@ -426,8 +426,7 @@ pub const Maps = struct {
                                             .wrap = false,
                                         }),
                                     }),
-                                    cx.make(ui.OutlinedButton{
-                                        .label = "×",
+                                    cx.make(ui.IconButton{
                                         .icon = .close,
                                         .on_press = .of(state, State.closeDetailCard),
                                     }),
@@ -505,8 +504,7 @@ pub const Maps = struct {
                                             .wrap = false,
                                         }),
                                     }),
-                                    cx.make(ui.OutlinedButton{
-                                        .label = "×",
+                                    cx.make(ui.IconButton{
                                         .icon = .close,
                                         .on_press = .of(state, State.toggleLayers),
                                     }),
