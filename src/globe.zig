@@ -268,6 +268,7 @@ pub const GlobeGpu = struct {
     vbo: vc4.Bo,
     ibo: vc4.Bo,
     texture: vc4.Bo,
+    vertex_count: u32,
     index_count: u32,
 
     pub fn init(gpa: std.mem.Allocator, dev: vc4.Device) !GlobeGpu {
@@ -308,6 +309,7 @@ pub const GlobeGpu = struct {
             .vbo = vbo,
             .ibo = ibo,
             .texture = texture,
+            .vertex_count = @intCast(mesh.vertices.len),
             .index_count = @intCast(mesh.indices.len),
         };
     }
@@ -361,7 +363,7 @@ pub const GlobeGpu = struct {
             .vertices = g.vbo.handle,
             .vertex_offset = 0,
             .count = g.index_count,
-            .indices = .{ .handle = g.ibo.handle, .offset = 0, .max_index = 0xffff },
+            .indices = .{ .handle = g.ibo.handle, .offset = 0, .max_index = g.vertex_count - 1 },
             .texture = .{ .handle = g.texture.handle, .config = .{ .width = texture_w, .height = texture_h } },
         });
     }
@@ -392,9 +394,15 @@ test "raycasting off the sphere" {
     try testing.expect(hit == null);
 }
 
-test "sphere mesh generation" {
-    const mesh = try generateSphere(testing.allocator, 10, 20);
+test "sphere mesh generation and globe shader validation" {
+    const mesh = try generateSphere(testing.allocator, 40, 80);
     defer mesh.deinit(testing.allocator);
-    try testing.expectEqual(@as(usize, 11 * 21), mesh.vertices.len);
-    try testing.expectEqual(@as(usize, 10 * 20 * 6), mesh.indices.len);
+    try testing.expectEqual(@as(usize, 41 * 81), mesh.vertices.len);
+    try testing.expectEqual(@as(usize, 40 * 80 * 6), mesh.indices.len);
+    for (mesh.indices) |idx| try testing.expect(idx < mesh.vertices.len);
+
+    const prog = try shader.Program.decode(@embedFile("globe.shader"));
+    for ([_]vc4.compiler.Compiled{ prog.fs, prog.vs, prog.cs }) |c| {
+        try vc4.qpu.validate(c.code(), c.stage, null);
+    }
 }
