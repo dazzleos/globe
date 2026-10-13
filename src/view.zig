@@ -15,8 +15,11 @@ pub const min_size = [2]u32{ 640, 420 };
 pub const open_size = [2]u32{ 1024, 680 };
 
 pub const button_bg = gfx.Color.argb(0xd8182232);
+pub const hud_text_color = gfx.Color.argb(0xffe8f0fa);
 pub const label_color = gfx.Color.argb(0xff202834);
 pub const label_halo_color = gfx.Color.argb(0xd8ffffff);
+pub const geoline_label_color = gfx.Color.argb(0xff146c9c);
+pub const detail_distance: f32 = 2.0;
 
 pub const Maps = struct {
     globe_gpu: ?*globe.GlobeGpu = null,
@@ -96,6 +99,15 @@ pub const Maps = struct {
             }),
         })) catch {};
 
+        // 3. Bottom-Left Coordinates & Altitude Overlay
+        layers.append(a, cx.make(ui.Align{
+            .alignment = .bottom_left,
+            .child = cx.make(ui.Padding{
+                .padding = .{ .left = 12, .bottom = 12 },
+                .child = bottomHud(cx, state),
+            }),
+        })) catch {};
+
         const content = cx.make(ui.Overlay{ .children = layers.items });
 
         if (is_fullscreen) {
@@ -114,6 +126,44 @@ pub const Maps = struct {
                 }),
                 cx.make(ui.Expanded{ .child = content }),
             },
+        });
+    }
+
+    fn bottomHud(cx: *ui.Context, state: *const State) ui.Widget {
+        const center_lat = state.pitch * (180.0 / std.math.pi);
+        const center_lon = -state.yaw * (180.0 / std.math.pi);
+        const alt_km = @as(u32, @intFromFloat(@max(state.distance - 1.0, 0.1) * 6371.0));
+
+        const lat_str = if (center_lat >= 0)
+            cx.fmt("{d:.1}° N", .{center_lat})
+        else
+            cx.fmt("{d:.1}° S", .{-center_lat});
+
+        var lon_wrapped = center_lon;
+        while (lon_wrapped > 180.0) lon_wrapped -= 360.0;
+        while (lon_wrapped < -180.0) lon_wrapped += 360.0;
+        const lon_str = if (lon_wrapped >= 0)
+            cx.fmt("{d:.1}° E", .{lon_wrapped})
+        else
+            cx.fmt("{d:.1}° W", .{-lon_wrapped});
+
+        const info = cx.fmt("{s}, {s}  ·  Altitude: {d} km", .{
+            lat_str,
+            lon_str,
+            alt_km,
+        });
+
+        return cx.make(ui.Decorated{
+            .color = button_bg,
+            .radius = gfx.Radii.all(10),
+            .child = cx.make(ui.Padding{
+                .padding = .{ .left = 14, .right = 14, .top = 8, .bottom = 8 },
+                .child = cx.make(ui.Text{
+                    .text = info,
+                    .style = .{ .size = 14, .color = hud_text_color },
+                    .wrap = false,
+                }),
+            }),
         });
     }
 };
@@ -205,6 +255,7 @@ pub const GlobeView = struct {
             rot,
             sun_dir,
             cam_model,
+            self.state.distance <= detail_distance,
         );
     }
 
@@ -231,25 +282,33 @@ pub const GlobeView = struct {
             -eye_pitch[0] * sin_y + eye_pitch[2] * cos_y,
         };
 
+        const high_detail = self.state.distance <= detail_distance;
+
         // 1. In CPU-only preview mode (no GPU), draw 2D projected country polygons
         // so unit tests and CPU previews show the political map as well:
         if (self.maps.globe_gpu == null) {
-            var ii: usize = 0;
-            while (ii + 2 < map_data.country_indices.len) : (ii += 3) {
-                const v0 = map_data.country_vertices[map_data.country_indices[ii]];
-                const v1 = map_data.country_vertices[map_data.country_indices[ii + 1]];
-                const v2 = map_data.country_vertices[map_data.country_indices[ii + 2]];
+            const verts = if (high_detail) &map_data.country_50m_vertices else &map_data.country_vertices;
+            const idxs = if (high_detail) &map_data.country_50m_indices else &map_data.country_indices;
+            const batches = if (high_detail) &map_data.country_50m_batches else &map_data.country_batches;
+            for (batches) |b| {
+                var ii: usize = b.idx_start;
+                const i_end: usize = ii + b.idx_count;
+                while (ii + 2 < i_end) : (ii += 3) {
+                    const v0 = verts[b.vert_start + idxs[ii]];
+                    const v1 = verts[b.vert_start + idxs[ii + 1]];
+                    const v2 = verts[b.vert_start + idxs[ii + 2]];
 
-                const p0 = globe.latLonToCartesian(@as(f32, @floatFromInt(v0.lat_cd)) * 0.01, @as(f32, @floatFromInt(v0.lon_cd)) * 0.01, 1.0);
-                const p1 = globe.latLonToCartesian(@as(f32, @floatFromInt(v1.lat_cd)) * 0.01, @as(f32, @floatFromInt(v1.lon_cd)) * 0.01, 1.0);
-                const p2 = globe.latLonToCartesian(@as(f32, @floatFromInt(v2.lat_cd)) * 0.01, @as(f32, @floatFromInt(v2.lon_cd)) * 0.01, 1.0);
+                    const p0 = globe.latLonToCartesian(@as(f32, @floatFromInt(v0.lat_cd)) * 0.01, @as(f32, @floatFromInt(v0.lon_cd)) * 0.01, 1.0);
+                    const p1 = globe.latLonToCartesian(@as(f32, @floatFromInt(v1.lat_cd)) * 0.01, @as(f32, @floatFromInt(v1.lon_cd)) * 0.01, 1.0);
+                    const p2 = globe.latLonToCartesian(@as(f32, @floatFromInt(v2.lat_cd)) * 0.01, @as(f32, @floatFromInt(v2.lon_cd)) * 0.01, 1.0);
 
-                if (globe.project(p0, mvp, cam_model, w, h)) |s0| {
-                    if (globe.project(p1, mvp, cam_model, w, h)) |s1| {
-                        if (globe.project(p2, mvp, cam_model, w, h)) |s2| {
-                            const pidx = @min(v0.color_idx, @as(u8, @intCast(map_data.country_palette.len - 1)));
-                            const col = gfx.Color.argb(map_data.country_palette[pidx]);
-                            c.fillPolygon(&.{ .{ s0[0], s0[1] }, .{ s1[0], s1[1] }, .{ s2[0], s2[1] } }, col);
+                    if (globe.project(p0, mvp, cam_model, w, h)) |s0| {
+                        if (globe.project(p1, mvp, cam_model, w, h)) |s1| {
+                            if (globe.project(p2, mvp, cam_model, w, h)) |s2| {
+                                const pidx = @min(v0.color_idx, @as(u8, @intCast(map_data.country_palette.len - 1)));
+                                const col = gfx.Color.argb(map_data.country_palette[pidx]);
+                                c.fillPolygon(&.{ .{ s0[0], s0[1] }, .{ s1[0], s1[1] }, .{ s2[0], s2[1] } }, col);
+                            }
                         }
                     }
                 }
@@ -258,13 +317,28 @@ pub const GlobeView = struct {
 
         // 2. Coastlines (#198EC8 from MapLibre globe style):
         const coast_col = gfx.Color.argb(map_data.coastline_color);
-        drawProjectedSpans(c, &map_data.coastline_points, &map_data.coastline_spans, mvp, cam_model, w, h, 1.2, coast_col);
+        if (high_detail) {
+            drawProjectedSpans(c, &map_data.coastline_50m_points, &map_data.coastline_50m_spans, mvp, cam_model, w, h, 1.2, coast_col);
+        } else {
+            drawProjectedSpans(c, &map_data.coastline_points, &map_data.coastline_spans, mvp, cam_model, w, h, 1.2, coast_col);
+        }
 
         // 3. International Country Boundaries (#FFFFFF from MapLibre globe style):
         const border_col = gfx.Color.argb(map_data.boundary_color);
-        drawProjectedSpans(c, &map_data.border_points, &map_data.border_spans, mvp, cam_model, w, h, 1.3, border_col);
+        if (high_detail) {
+            drawProjectedSpans(c, &map_data.border_50m_points, &map_data.border_50m_spans, mvp, cam_model, w, h, 1.3, border_col);
+        } else {
+            drawProjectedSpans(c, &map_data.border_points, &map_data.border_spans, mvp, cam_model, w, h, 1.3, border_col);
+        }
 
-        // 4. Country Name Labels (decluttered by zoom level and screen-space bounding boxes):
+        // 4. Equator, Tropics, and Polar Circles (MapLibre geolines style):
+        drawParallel(c, 0.0, false, 1.3, gfx.Color.argb(0xA8198EC8), mvp, cam_model, w, h);
+        drawParallel(c, 23.4368, true, 1.1, gfx.Color.argb(0x88198EC8), mvp, cam_model, w, h);
+        drawParallel(c, -23.4368, true, 1.1, gfx.Color.argb(0x88198EC8), mvp, cam_model, w, h);
+        drawParallel(c, 66.5632, true, 1.0, gfx.Color.argb(0x70198EC8), mvp, cam_model, w, h);
+        drawParallel(c, -66.5632, true, 1.0, gfx.Color.argb(0x70198EC8), mvp, cam_model, w, h);
+
+        // 5. Country & Geoline Labels (decluttered by zoom level and screen-space bounding boxes):
         const max_rank: u8 = if (self.state.distance > 3.0)
             2
         else if (self.state.distance > 2.2)
@@ -285,7 +359,40 @@ pub const GlobeView = struct {
         var placed_boxes: [64]gfx.Rect = undefined;
         var placed_count: usize = 0;
 
-        for (map_data.country_labels) |lbl| {
+        // Place Equator and Tropics labels near the central meridian:
+        const center_lon = -self.state.yaw * (180.0 / std.math.pi);
+        const GeolineLabel = struct { name: []const u8, lat: f32 };
+        for ([_]GeolineLabel{
+            .{ .name = "Equator", .lat = 0.0 },
+            .{ .name = "Tropic of Cancer", .lat = 23.4368 },
+            .{ .name = "Tropic of Capricorn", .lat = -23.4368 },
+        }) |gl| {
+            const p3 = globe.latLonToCartesian(gl.lat, center_lon, 1.004);
+            const facing = p3[0] * cam_dir[0] + p3[1] * cam_dir[1] + p3[2] * cam_dir[2];
+            if (facing < 0.45) continue;
+            if (globe.project(p3, mvp, cam_model, w, h)) |scr| {
+                const f = p.ui.font orelse continue;
+                const font_size: f32 = 10.5;
+                const style: font.Style = .{ .font = f, .size = font_size };
+                const text_w = p.ui.atlas.runs.measure(style, gl.name);
+                const text_h = style.lineHeight();
+                const lx = scr[0] - text_w * 0.5;
+                const ly = scr[1] - text_h - 2.0;
+                const box = gfx.Rect{ .x = lx - 4, .y = ly - 2, .w = text_w + 8, .h = text_h + 4 };
+                if (box.x < 8 or box.y < 8 or box.x + box.w > w - 8 or box.y + box.h > h - 8) continue;
+                placed_boxes[placed_count] = box;
+                placed_count += 1;
+                const baseline_y = ly + style.ascent();
+                _ = p.text(font_size, lx - 1, baseline_y, gl.name, label_halo_color);
+                _ = p.text(font_size, lx + 1, baseline_y, gl.name, label_halo_color);
+                _ = p.text(font_size, lx, baseline_y - 1, gl.name, label_halo_color);
+                _ = p.text(font_size, lx, baseline_y + 1, gl.name, label_halo_color);
+                _ = p.text(font_size, lx, baseline_y, gl.name, geoline_label_color);
+            }
+        }
+
+        const labels = if (high_detail) &map_data.country_50m_labels else &map_data.country_labels;
+        for (labels) |lbl| {
             if (lbl.rank > max_rank) continue;
             if (placed_count >= placed_boxes.len) break;
 
@@ -375,6 +482,48 @@ pub const GlobeView = struct {
             if (count >= 2) {
                 c.strokePolyline(pts[0..count], false, thickness, color);
             }
+        }
+    }
+
+    fn drawParallel(
+        c: *gfx.Canvas,
+        lat: f32,
+        dashed: bool,
+        thickness: f32,
+        color: gfx.Color,
+        mvp: globe.Mat4,
+        cam_model: [3]f32,
+        w: f32,
+        h: f32,
+    ) void {
+        if (dashed) {
+            // 4° dash, 2° gap around the parallel (60 dashes of 4° each):
+            var seg: u32 = 0;
+            while (seg < 60) : (seg += 1) {
+                const lon0 = @as(f32, @floatFromInt(seg * 6)) - 180.0;
+                const lon1 = lon0 + 2.0;
+                const lon2 = lon0 + 4.0;
+                const s0 = globe.project(globe.latLonToCartesian(lat, lon0, 1.0035), mvp, cam_model, w, h) orelse continue;
+                const s1 = globe.project(globe.latLonToCartesian(lat, lon1, 1.0035), mvp, cam_model, w, h) orelse continue;
+                const s2 = globe.project(globe.latLonToCartesian(lat, lon2, 1.0035), mvp, cam_model, w, h) orelse continue;
+                c.strokePolyline(&.{ .{ s0[0], s0[1] }, .{ s1[0], s1[1] }, .{ s2[0], s2[1] } }, false, thickness, color);
+            }
+        } else {
+            var pts: [181]gfx.Point = undefined;
+            var count: usize = 0;
+            var i: u32 = 0;
+            while (i <= 180) : (i += 1) {
+                const lon = @as(f32, @floatFromInt(i * 2)) - 180.0;
+                const p3 = globe.latLonToCartesian(lat, lon, 1.0035);
+                if (globe.project(p3, mvp, cam_model, w, h)) |scr| {
+                    pts[count] = .{ scr[0], scr[1] };
+                    count += 1;
+                } else {
+                    if (count >= 2) c.strokePolyline(pts[0..count], false, thickness, color);
+                    count = 0;
+                }
+            }
+            if (count >= 2) c.strokePolyline(pts[0..count], false, thickness, color);
         }
     }
 
@@ -556,3 +705,35 @@ test "dragging the globe with touch moves it immediately without cancelling pres
     u.touchUp(1);
     try testing.expect(!state.is_dragging);
 }
+
+test "zooming in transitions to the 50m resolution dataset and renders cleanly" {
+    const font_data = @import("font");
+    const f = try font_data.Font.init(@embedFile("FiraSans-Regular.ttf"));
+    const u = try ui.Ui.create(testing.allocator, &f);
+    defer u.destroy();
+
+    var state = Maps.State{};
+    try testing.expect(state.distance > detail_distance);
+
+    const Root = struct {
+        s: *Maps.State,
+        pub fn build(self: *const @This(), cx: *ui.Context) ui.Widget {
+            return (Maps{}).build(cx, self.s);
+        }
+    };
+
+    state.zoomIn();
+    state.zoomIn();
+    try testing.expect(state.distance <= detail_distance);
+
+    u.frame(800, 600, 0, Root{ .s = &state });
+
+    const Check = struct {
+        fn none(n: *ui.Node) !void {
+            try testing.expect(!n.overflow.any());
+            for (n.children.items) |ch| try none(ch);
+        }
+    };
+    try Check.none(u.root.?);
+}
+

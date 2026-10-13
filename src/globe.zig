@@ -320,17 +320,36 @@ pub fn generateSphere(gpa: std.mem.Allocator, lat_segs: u32, lon_segs: u32) !Mes
     return .{ .vertices = vertices, .indices = indices };
 }
 
-/// Generates the complete 3D vector globe mesh combining the ocean sphere
-/// and all Natural Earth 110m country vector triangles.
-pub fn generateVectorGlobeMesh(gpa: std.mem.Allocator) !Mesh {
+pub const DrawBatch = struct {
+    vertex_offset: u32,
+    vertex_count: u32,
+    index_offset: u32,
+    index_count: u32,
+};
+
+pub const BatchedMesh = struct {
+    vertices: []Vertex,
+    indices: []u16,
+    batches: [16]DrawBatch = undefined,
+    batch_count: usize = 0,
+
+    pub fn deinit(m: BatchedMesh, gpa: std.mem.Allocator) void {
+        gpa.free(m.vertices);
+        gpa.free(m.indices);
+    }
+};
+
+pub fn generateVectorGlobeBatchedMesh(
+    gpa: std.mem.Allocator,
+    country_verts: []const map_data.CountryVertex,
+    country_idxs: []const u16,
+    country_batches: []const map_data.MeshBatch,
+) !BatchedMesh {
     const sphere = try generateSphere(gpa, 40, 80);
     defer sphere.deinit(gpa);
 
-    const country_v_count = map_data.country_vertices.len;
-    const country_i_count = map_data.country_indices.len;
-
-    const total_v = sphere.vertices.len + country_v_count;
-    const total_i = sphere.indices.len + country_i_count;
+    const total_v = sphere.vertices.len + country_verts.len;
+    const total_i = sphere.indices.len + country_idxs.len;
 
     const vertices = try gpa.alloc(Vertex, total_v);
     errdefer gpa.free(vertices);
@@ -342,8 +361,7 @@ pub fn generateVectorGlobeMesh(gpa: std.mem.Allocator) !Mesh {
     @memcpy(indices[0..sphere.indices.len], sphere.indices);
 
     // 2. Append Natural Earth country vertices slightly above unit sphere (r = 1.003):
-    const v_base: u16 = @intCast(sphere.vertices.len);
-    for (map_data.country_vertices, 0..) |cv, i| {
+    for (country_verts, 0..) |cv, i| {
         const lat_deg = @as(f32, @floatFromInt(cv.lat_cd)) * 0.01;
         const lon_deg = @as(f32, @floatFromInt(cv.lon_cd)) * 0.01;
         const n = latLonToCartesian(lat_deg, lon_deg, 1.0);
@@ -358,47 +376,102 @@ pub fn generateVectorGlobeMesh(gpa: std.mem.Allocator) !Mesh {
         };
     }
 
-    // 3. Append country triangle indices with consistent outward CCW winding:
-    var out_ii: usize = sphere.indices.len;
-    var src_ii: usize = 0;
-    while (src_ii + 2 < country_i_count) : (src_ii += 3) {
-        const idx0 = v_base + map_data.country_indices[src_ii];
-        const idx1 = v_base + map_data.country_indices[src_ii + 1];
-        const idx2 = v_base + map_data.country_indices[src_ii + 2];
+    // 3. Append country triangle indices per batch with consistent outward CCW winding:
+    var bm = BatchedMesh{
+        .vertices = vertices,
+        .indices = indices,
+        .batch_count = country_batches.len,
+    };
 
-        const p0 = vertices[idx0].pos;
-        const p1 = vertices[idx1].pos;
-        const p2 = vertices[idx2].pos;
+    for (country_batches, 0..) |b, bi| {
+        const is_first = (bi == 0);
+        const idx_bias: u16 = if (is_first) @intCast(sphere.vertices.len) else 0;
+        const v_abs_base: usize = sphere.vertices.len + @as(usize, b.vert_start);
 
-        const e1 = [3]f32{ p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2] };
-        const e2 = [3]f32{ p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2] };
-        const cx = e1[1] * e2[2] - e1[2] * e2[1];
-        const cy = e1[2] * e2[0] - e1[0] * e2[2];
-        const cz = e1[0] * e2[1] - e1[1] * e2[0];
-        const dot = cx * p0[0] + cy * p0[1] + cz * p0[2];
+        var out_ii: usize = sphere.indices.len + @as(usize, b.idx_start);
+        var src_ii: usize = @as(usize, b.idx_start);
+        const src_end: usize = src_ii + @as(usize, b.idx_count);
+        while (src_ii + 2 < src_end) : (src_ii += 3) {
+            const raw0 = country_idxs[src_ii];
+            const raw1 = country_idxs[src_ii + 1];
+            const raw2 = country_idxs[src_ii + 2];
 
-        if (dot >= 0) {
-            indices[out_ii] = idx0;
-            indices[out_ii + 1] = idx1;
-            indices[out_ii + 2] = idx2;
-        } else {
-            indices[out_ii] = idx0;
-            indices[out_ii + 1] = idx2;
-            indices[out_ii + 2] = idx1;
+            const p0 = vertices[v_abs_base + raw0].pos;
+            const p1 = vertices[v_abs_base + raw1].pos;
+            const p2 = vertices[v_abs_base + raw2].pos;
+
+            const e1 = [3]f32{ p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2] };
+            const e2 = [3]f32{ p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2] };
+            const cx = e1[1] * e2[2] - e1[2] * e2[1];
+            const cy = e1[2] * e2[0] - e1[0] * e2[2];
+            const cz = e1[0] * e2[1] - e1[1] * e2[0];
+            const dot = cx * p0[0] + cy * p0[1] + cz * p0[2];
+
+            if (dot >= 0) {
+                indices[out_ii] = idx_bias + raw0;
+                indices[out_ii + 1] = idx_bias + raw1;
+                indices[out_ii + 2] = idx_bias + raw2;
+            } else {
+                indices[out_ii] = idx_bias + raw0;
+                indices[out_ii + 1] = idx_bias + raw2;
+                indices[out_ii + 2] = idx_bias + raw1;
+            }
+            out_ii += 3;
         }
-        out_ii += 3;
+
+        if (is_first) {
+            bm.batches[bi] = .{
+                .vertex_offset = 0,
+                .vertex_count = @intCast(sphere.vertices.len + @as(usize, b.vert_count)),
+                .index_offset = 0,
+                .index_count = @intCast(sphere.indices.len + @as(usize, b.idx_count)),
+            };
+        } else {
+            bm.batches[bi] = .{
+                .vertex_offset = @intCast(v_abs_base * @sizeOf(Vertex)),
+                .vertex_count = b.vert_count,
+                .index_offset = @intCast((sphere.indices.len + @as(usize, b.idx_start)) * 2),
+                .index_count = b.idx_count,
+            };
+        }
     }
 
-    return .{ .vertices = vertices, .indices = indices };
+    return bm;
+}
+
+/// Generates the complete 3D vector globe mesh combining the ocean sphere
+/// and all Natural Earth 110m country vector triangles.
+pub fn generateVectorGlobeMesh(gpa: std.mem.Allocator) !Mesh {
+    const bm = try generateVectorGlobeBatchedMesh(
+        gpa,
+        &map_data.country_vertices,
+        &map_data.country_indices,
+        &map_data.country_batches,
+    );
+    return .{ .vertices = bm.vertices, .indices = bm.indices };
+}
+
+/// Generates the high-detail 50m 3D vector globe mesh split into 16-bit index batches.
+pub fn generateVectorGlobeMesh50m(gpa: std.mem.Allocator) !BatchedMesh {
+    return generateVectorGlobeBatchedMesh(
+        gpa,
+        &map_data.country_50m_vertices,
+        &map_data.country_50m_indices,
+        &map_data.country_50m_batches,
+    );
 }
 
 /// GPU rendering resources for the 3D Vector Globe on Raspberry Pi VideoCore IV.
 pub const GlobeGpu = struct {
     pipeline: shader.Pipeline,
-    vbo: vc4.Bo,
-    ibo: vc4.Bo,
-    vertex_count: u32,
-    index_count: u32,
+    vbo_110m: vc4.Bo,
+    ibo_110m: vc4.Bo,
+    batches_110m: [16]DrawBatch,
+    batch_count_110m: usize,
+    vbo_50m: vc4.Bo,
+    ibo_50m: vc4.Bo,
+    batches_50m: [16]DrawBatch,
+    batch_count_50m: usize,
 
     pub fn init(gpa: std.mem.Allocator, dev: vc4.Device) !GlobeGpu {
         const program = shader.Program.decode(@embedFile("globe.shader")) catch unreachable;
@@ -413,30 +486,52 @@ pub const GlobeGpu = struct {
         });
         errdefer pipeline.deinit(dev);
 
-        const mesh = try generateVectorGlobeMesh(gpa);
-        defer mesh.deinit(gpa);
+        const mesh_110m = try generateVectorGlobeBatchedMesh(
+            gpa,
+            &map_data.country_vertices,
+            &map_data.country_indices,
+            &map_data.country_batches,
+        );
+        defer mesh_110m.deinit(gpa);
 
-        const vbo = try dev.createBo(@intCast(mesh.vertices.len * @sizeOf(Vertex)));
-        errdefer dev.destroyBo(vbo);
-        const ibo = try dev.createBo(@intCast(mesh.indices.len * 2));
-        errdefer dev.destroyBo(ibo);
+        const vbo_110m = try dev.createBo(@intCast(mesh_110m.vertices.len * @sizeOf(Vertex)));
+        errdefer dev.destroyBo(vbo_110m);
+        const ibo_110m = try dev.createBo(@intCast(mesh_110m.indices.len * 2));
+        errdefer dev.destroyBo(ibo_110m);
 
-        @memcpy(vbo.map[0 .. mesh.vertices.len * @sizeOf(Vertex)], std.mem.sliceAsBytes(mesh.vertices));
-        @memcpy(ibo.map[0 .. mesh.indices.len * 2], std.mem.sliceAsBytes(mesh.indices));
+        @memcpy(vbo_110m.map[0 .. mesh_110m.vertices.len * @sizeOf(Vertex)], std.mem.sliceAsBytes(mesh_110m.vertices));
+        @memcpy(ibo_110m.map[0 .. mesh_110m.indices.len * 2], std.mem.sliceAsBytes(mesh_110m.indices));
+
+        const mesh_50m = try generateVectorGlobeMesh50m(gpa);
+        defer mesh_50m.deinit(gpa);
+
+        const vbo_50m = try dev.createBo(@intCast(mesh_50m.vertices.len * @sizeOf(Vertex)));
+        errdefer dev.destroyBo(vbo_50m);
+        const ibo_50m = try dev.createBo(@intCast(mesh_50m.indices.len * 2));
+        errdefer dev.destroyBo(ibo_50m);
+
+        @memcpy(vbo_50m.map[0 .. mesh_50m.vertices.len * @sizeOf(Vertex)], std.mem.sliceAsBytes(mesh_50m.vertices));
+        @memcpy(ibo_50m.map[0 .. mesh_50m.indices.len * 2], std.mem.sliceAsBytes(mesh_50m.indices));
 
         return .{
             .pipeline = pipeline,
-            .vbo = vbo,
-            .ibo = ibo,
-            .vertex_count = @intCast(mesh.vertices.len),
-            .index_count = @intCast(mesh.indices.len),
+            .vbo_110m = vbo_110m,
+            .ibo_110m = ibo_110m,
+            .batches_110m = mesh_110m.batches,
+            .batch_count_110m = mesh_110m.batch_count,
+            .vbo_50m = vbo_50m,
+            .ibo_50m = ibo_50m,
+            .batches_50m = mesh_50m.batches,
+            .batch_count_50m = mesh_50m.batch_count,
         };
     }
 
     pub fn deinit(g: *GlobeGpu, dev: vc4.Device) void {
         g.pipeline.deinit(dev);
-        dev.destroyBo(g.vbo);
-        dev.destroyBo(g.ibo);
+        dev.destroyBo(g.vbo_110m);
+        dev.destroyBo(g.ibo_110m);
+        dev.destroyBo(g.vbo_50m);
+        dev.destroyBo(g.ibo_50m);
     }
 
     pub fn draw(
@@ -448,6 +543,7 @@ pub const GlobeGpu = struct {
         rot_mat: Mat4,
         sun_dir: [3]f32,
         cam_pos: [3]f32,
+        high_detail: bool,
     ) !void {
         // Uniforms layout matches globe.zig shader:
         // mvp: [4]Vec4 (16 floats)
@@ -469,14 +565,28 @@ pub const GlobeGpu = struct {
         uniforms[32..36].* = .{ cam_pos[0], cam_pos[1], cam_pos[2], 0.0 };
 
         g.pipeline.setUniforms(std.mem.asBytes(&uniforms));
-        try g.pipeline.draw(frame, .{
-            .viewport = viewport,
-            .scissor = scissor,
-            .vertices = g.vbo.handle,
-            .vertex_offset = 0,
-            .count = g.index_count,
-            .indices = .{ .handle = g.ibo.handle, .offset = 0, .max_index = g.vertex_count - 1 },
-        });
+
+        const vbo_handle = if (high_detail) g.vbo_50m.handle else g.vbo_110m.handle;
+        const ibo_handle = if (high_detail) g.ibo_50m.handle else g.ibo_110m.handle;
+        const batches = if (high_detail)
+            g.batches_50m[0..g.batch_count_50m]
+        else
+            g.batches_110m[0..g.batch_count_110m];
+
+        for (batches) |b| {
+            try g.pipeline.draw(frame, .{
+                .viewport = viewport,
+                .scissor = scissor,
+                .vertices = vbo_handle,
+                .vertex_offset = b.vertex_offset,
+                .count = b.index_count,
+                .indices = .{
+                    .handle = ibo_handle,
+                    .offset = b.index_offset,
+                    .max_index = b.vertex_count - 1,
+                },
+            });
+        }
     }
 };
 
@@ -545,6 +655,19 @@ test "vector globe mesh generation and globe shader validation" {
     try testing.expectApproxEqAbs(expected[0], prime_eq.pos[0], 1e-5);
     try testing.expectApproxEqAbs(expected[1], prime_eq.pos[1], 1e-5);
     try testing.expectApproxEqAbs(expected[2], prime_eq.pos[2], 1e-5);
+
+    const mesh_50m = try generateVectorGlobeMesh50m(testing.allocator);
+    defer mesh_50m.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 41 * 81 + map_data.country_50m_vertices.len), mesh_50m.vertices.len);
+    try testing.expectEqual(@as(usize, 40 * 80 * 6 + map_data.country_50m_indices.len), mesh_50m.indices.len);
+    try testing.expect(mesh_50m.batch_count >= 1);
+    for (mesh_50m.batches[0..mesh_50m.batch_count]) |b| {
+        try testing.expect(b.vertex_count <= 65535);
+        const i_start = b.index_offset / 2;
+        for (mesh_50m.indices[i_start .. i_start + b.index_count]) |idx| {
+            try testing.expect(idx < b.vertex_count);
+        }
+    }
 
     const prog = try shader.Program.decode(@embedFile("globe.shader"));
     for ([_]vc4.compiler.Compiled{ prog.fs, prog.vs, prog.cs }) |c| {

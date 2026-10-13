@@ -139,13 +139,15 @@ pub fn earClip(gpa: std.mem.Allocator, ring: []const Point2f, out: *std.ArrayLis
     defer idxs.deinit(gpa);
     for (0..pts.items.len) |i| try idxs.append(gpa, i);
 
+    var cur: usize = 0;
     var guard: usize = 0;
-    const max_guard = pts.items.len * pts.items.len * 2 + 100;
+    const max_guard = pts.items.len * 4 + 100;
     while (idxs.items.len > 3 and guard < max_guard) {
         guard += 1;
         var ear_found = false;
         const m = idxs.items.len;
-        for (0..m) |i| {
+        for (0..m) |step| {
+            const i = (cur + step) % m;
             const i_prev = idxs.items[(i + m - 1) % m];
             const i_curr = idxs.items[i];
             const i_next = idxs.items[(i + 1) % m];
@@ -154,10 +156,16 @@ pub fn earClip(gpa: std.mem.Allocator, ring: []const Point2f, out: *std.ArrayLis
             const c = pts.items[i_next];
             if (cross2d(a, b, c) <= 1e-9) continue;
 
+            const min_x = @min(a[0], @min(b[0], c[0]));
+            const max_x = @max(a[0], @max(b[0], c[0]));
+            const min_y = @min(a[1], @min(b[1], c[1]));
+            const max_y = @max(a[1], @max(b[1], c[1]));
+
             var inside = false;
             for (0..m) |j| {
                 if (j == (i + m - 1) % m or j == i or j == (i + 1) % m) continue;
                 const p = pts.items[idxs.items[j]];
+                if (p[0] < min_x or p[0] > max_x or p[1] < min_y or p[1] > max_y) continue;
                 if (pointInTri(p, a, b, c)) {
                     inside = true;
                     break;
@@ -166,12 +174,14 @@ pub fn earClip(gpa: std.mem.Allocator, ring: []const Point2f, out: *std.ArrayLis
             if (!inside) {
                 try out.append(gpa, .{ a, b, c });
                 _ = idxs.orderedRemove(i);
+                cur = if (i == 0) 0 else (i - 1) % idxs.items.len;
                 ear_found = true;
                 break;
             }
         }
         if (!ear_found) {
-            for (0..m) |i| {
+            for (0..m) |step| {
+                const i = (cur + step) % m;
                 const i_prev = idxs.items[(i + m - 1) % m];
                 const i_curr = idxs.items[i];
                 const i_next = idxs.items[(i + 1) % m];
@@ -181,6 +191,7 @@ pub fn earClip(gpa: std.mem.Allocator, ring: []const Point2f, out: *std.ArrayLis
                 if (cross2d(a, b, c) > 0) {
                     try out.append(gpa, .{ a, b, c });
                     _ = idxs.orderedRemove(i);
+                    cur = if (i == 0) 0 else (i - 1) % idxs.items.len;
                     ear_found = true;
                     break;
                 }
@@ -191,6 +202,7 @@ pub fn earClip(gpa: std.mem.Allocator, ring: []const Point2f, out: *std.ArrayLis
                 const c = pts.items[idxs.items[2]];
                 try out.append(gpa, .{ a, b, c });
                 _ = idxs.orderedRemove(1);
+                cur = 0;
             }
         }
     }
@@ -270,6 +282,26 @@ const LabelInfo = struct {
     rank: u8,
 };
 
+const Span = struct { start: u32, len: u16 };
+
+const BatchInfo = struct {
+    vert_start: u32,
+    vert_count: u16,
+    idx_start: u32,
+    idx_count: u32,
+};
+
+const LodDataset = struct {
+    verts: []const VertKey,
+    tri_indices: []const [3]u16,
+    batches: []const BatchInfo,
+    coast_pts: []const QuantPt,
+    coast_spans: []const Span,
+    border_pts: []const QuantPt,
+    border_spans: []const Span,
+    labels: []const LabelInfo,
+};
+
 fn jsonNumber(v: std.json.Value) ?f64 {
     return switch (v) {
         .float => |f| f,
@@ -286,7 +318,7 @@ fn jsonString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     };
 }
 
-pub fn generate(arena: std.mem.Allocator, geojson_bytes: []const u8) ![]u8 {
+fn buildDataset(arena: std.mem.Allocator, geojson_bytes: []const u8) !LodDataset {
     const parsed = try std.json.parseFromSlice(std.json.Value, arena, geojson_bytes, .{});
     const root = parsed.value.object;
     const features = root.get("features").?.array.items;
@@ -340,6 +372,9 @@ pub fn generate(arena: std.mem.Allocator, geojson_bytes: []const u8) ![]u8 {
     var vert_map: std.AutoHashMapUnmanaged(VertKey, u16) = .empty;
     var verts: std.ArrayList(VertKey) = .empty;
     var tri_indices: std.ArrayList([3]u16) = .empty;
+    var batches: std.ArrayList(BatchInfo) = .empty;
+    var batch_vert_start: u32 = 0;
+    var batch_idx_start: u32 = 0;
 
     var raw_tris: std.ArrayList(Tri) = .empty;
     var sub_tris: std.ArrayList(Tri) = .empty;
@@ -352,16 +387,36 @@ pub fn generate(arena: std.mem.Allocator, geojson_bytes: []const u8) ![]u8 {
             try subdivideTri(arena, t[0], t[1], t[2], 7.0, 0, &sub_tris);
         }
         for (sub_tris.items) |st| {
-            const v0 = try internVert(arena, &vert_map, &verts, st[0][0], st[0][1], cr.color_idx);
-            const v1 = try internVert(arena, &vert_map, &verts, st[1][0], st[1][1], cr.color_idx);
-            const v2 = try internVert(arena, &vert_map, &verts, st[2][0], st[2][1], cr.color_idx);
+            // Keep each batch well under u16's 65535 vertex limit (leaving room for the 3321-vertex ocean sphere in batch 0):
+            const max_batch_verts: usize = if (batches.items.len == 0) 56_000 else 60_000;
+            if ((verts.items.len - batch_vert_start) + 3 > max_batch_verts and verts.items.len > batch_vert_start) {
+                try batches.append(arena, .{
+                    .vert_start = batch_vert_start,
+                    .vert_count = @intCast(verts.items.len - batch_vert_start),
+                    .idx_start = batch_idx_start,
+                    .idx_count = @intCast(tri_indices.items.len * 3 - batch_idx_start),
+                });
+                vert_map.clearRetainingCapacity();
+                batch_vert_start = @intCast(verts.items.len);
+                batch_idx_start = @intCast(tri_indices.items.len * 3);
+            }
+            const v0 = try internVert(arena, &vert_map, &verts, batch_vert_start, st[0][0], st[0][1], cr.color_idx);
+            const v1 = try internVert(arena, &vert_map, &verts, batch_vert_start, st[1][0], st[1][1], cr.color_idx);
+            const v2 = try internVert(arena, &vert_map, &verts, batch_vert_start, st[2][0], st[2][1], cr.color_idx);
             if (v0 != v1 and v1 != v2 and v2 != v0) {
                 try tri_indices.append(arena, .{ v0, v1, v2 });
             }
         }
     }
+    if (verts.items.len > batch_vert_start) {
+        try batches.append(arena, .{
+            .vert_start = batch_vert_start,
+            .vert_count = @intCast(verts.items.len - batch_vert_start),
+            .idx_start = batch_idx_start,
+            .idx_count = @intCast(tri_indices.items.len * 3 - batch_idx_start),
+        });
+    }
 
-    const Span = struct { start: u32, len: u16 };
     var coast_pts: std.ArrayList(QuantPt) = .empty;
     var coast_spans: std.ArrayList(Span) = .empty;
     var border_pts: std.ArrayList(QuantPt) = .empty;
@@ -441,10 +496,98 @@ pub fn generate(arena: std.mem.Allocator, geojson_bytes: []const u8) ![]u8 {
         try Flush.call(arena, curr_kind, &curr_pts, &coast_pts, &coast_spans, &border_pts, &border_spans);
     }
 
+    return .{
+        .verts = verts.items,
+        .tri_indices = tri_indices.items,
+        .batches = batches.items,
+        .coast_pts = coast_pts.items,
+        .coast_spans = coast_spans.items,
+        .border_pts = border_pts.items,
+        .border_spans = border_spans.items,
+        .labels = labels.items,
+    };
+}
+
+fn writeDatasetArrays(
+    arena: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    suffix: []const u8,
+    d: LodDataset,
+) !void {
+    try out.print(arena, "pub const country{s}_vertices = [{d}]CountryVertex{{\n", .{ suffix, d.verts.len });
+    for (d.verts) |v| {
+        try out.print(arena, "    .{{ .lon_cd = {d}, .lat_cd = {d}, .color_idx = {d} }},\n", .{ v.lon_cd, v.lat_cd, v.color_idx });
+    }
+    try out.appendSlice(arena, "};\n\n");
+
+    try out.print(arena, "pub const country{s}_indices = [{d}]u16{{\n", .{ suffix, d.tri_indices.len * 3 });
+    for (d.tri_indices) |t| {
+        try out.print(arena, "    {d}, {d}, {d},\n", .{ t[0], t[1], t[2] });
+    }
+    try out.appendSlice(arena, "};\n\n");
+
+    try out.print(arena, "pub const country{s}_batches = [{d}]MeshBatch{{\n", .{ suffix, d.batches.len });
+    for (d.batches) |b| {
+        try out.print(arena, "    .{{ .vert_start = {d}, .vert_count = {d}, .idx_start = {d}, .idx_count = {d} }},\n", .{
+            b.vert_start,
+            b.vert_count,
+            b.idx_start,
+            b.idx_count,
+        });
+    }
+    try out.appendSlice(arena, "};\n\n");
+
+    try out.print(arena, "pub const coastline{s}_points = [{d}][2]i16{{\n", .{ suffix, d.coast_pts.len });
+    for (d.coast_pts) |p| {
+        try out.print(arena, "    .{{ {d}, {d} }},\n", .{ p[0], p[1] });
+    }
+    try out.appendSlice(arena, "};\n\n");
+
+    try out.print(arena, "pub const coastline{s}_spans = [{d}]LineSpan{{\n", .{ suffix, d.coast_spans.len });
+    for (d.coast_spans) |sp| {
+        try out.print(arena, "    .{{ .start = {d}, .len = {d} }},\n", .{ sp.start, sp.len });
+    }
+    try out.appendSlice(arena, "};\n\n");
+
+    try out.print(arena, "pub const border{s}_points = [{d}][2]i16{{\n", .{ suffix, d.border_pts.len });
+    for (d.border_pts) |p| {
+        try out.print(arena, "    .{{ {d}, {d} }},\n", .{ p[0], p[1] });
+    }
+    try out.appendSlice(arena, "};\n\n");
+
+    try out.print(arena, "pub const border{s}_spans = [{d}]LineSpan{{\n", .{ suffix, d.border_spans.len });
+    for (d.border_spans) |sp| {
+        try out.print(arena, "    .{{ .start = {d}, .len = {d} }},\n", .{ sp.start, sp.len });
+    }
+    try out.appendSlice(arena, "};\n\n");
+
+    try out.print(arena, "pub const country{s}_labels = [{d}]CountryLabel{{\n", .{ suffix, d.labels.len });
+    for (d.labels) |lbl| {
+        try out.print(arena, "    .{{ .name = \"{f}\", .lat = {d:.2}, .lon = {d:.2}, .rank = {d} }},\n", .{
+            std.zig.fmtString(lbl.name),
+            lbl.lat,
+            lbl.lon,
+            lbl.rank,
+        });
+    }
+    try out.appendSlice(arena, "};\n\n");
+}
+
+pub fn generate(arena: std.mem.Allocator, geojson_110m: []const u8) ![]u8 {
+    return generateTwoLod(arena, geojson_110m, geojson_110m);
+}
+
+pub fn generateTwoLod(arena: std.mem.Allocator, geojson_110m: []const u8, geojson_50m: []const u8) ![]u8 {
+    const lod_110m = try buildDataset(arena, geojson_110m);
+    const lod_50m = if (geojson_50m.ptr == geojson_110m.ptr and geojson_50m.len == geojson_110m.len)
+        lod_110m
+    else
+        try buildDataset(arena, geojson_50m);
+
     var out: std.ArrayList(u8) = .empty;
     try out.appendSlice(arena,
-        \\//! Natural Earth 110m Admin-0 Countries vector dataset and MapLibre globe
-        \\//! color styling (generated at build time by tools/mkmap.zig).
+        \\//! Natural Earth 110m and 50m Admin-0 Countries vector datasets and MapLibre
+        \\//! globe color styling (generated at build time by tools/mkmap.zig).
         \\
         \\pub const Coord = struct {
         \\    lat: f32,
@@ -477,6 +620,13 @@ pub fn generate(arena: std.mem.Allocator, geojson_bytes: []const u8) ![]u8 {
         \\    color_idx: u8,
         \\};
         \\
+        \\pub const MeshBatch = struct {
+        \\    vert_start: u32,
+        \\    vert_count: u16,
+        \\    idx_start: u32,
+        \\    idx_count: u32,
+        \\};
+        \\
         \\pub const LineSpan = struct {
         \\    start: u32,
         \\    len: u16,
@@ -492,52 +642,8 @@ pub fn generate(arena: std.mem.Allocator, geojson_bytes: []const u8) ![]u8 {
         \\
     );
 
-    try out.print(arena, "pub const country_vertices = [{d}]CountryVertex{{\n", .{verts.items.len});
-    for (verts.items) |v| {
-        try out.print(arena, "    .{{ .lon_cd = {d}, .lat_cd = {d}, .color_idx = {d} }},\n", .{ v.lon_cd, v.lat_cd, v.color_idx });
-    }
-    try out.appendSlice(arena, "};\n\n");
-
-    try out.print(arena, "pub const country_indices = [{d}]u16{{\n", .{tri_indices.items.len * 3});
-    for (tri_indices.items) |t| {
-        try out.print(arena, "    {d}, {d}, {d},\n", .{ t[0], t[1], t[2] });
-    }
-    try out.appendSlice(arena, "};\n\n");
-
-    try out.print(arena, "pub const coastline_points = [{d}][2]i16{{\n", .{coast_pts.items.len});
-    for (coast_pts.items) |p| {
-        try out.print(arena, "    .{{ {d}, {d} }},\n", .{ p[0], p[1] });
-    }
-    try out.appendSlice(arena, "};\n\n");
-
-    try out.print(arena, "pub const coastline_spans = [{d}]LineSpan{{\n", .{coast_spans.items.len});
-    for (coast_spans.items) |sp| {
-        try out.print(arena, "    .{{ .start = {d}, .len = {d} }},\n", .{ sp.start, sp.len });
-    }
-    try out.appendSlice(arena, "};\n\n");
-
-    try out.print(arena, "pub const border_points = [{d}][2]i16{{\n", .{border_pts.items.len});
-    for (border_pts.items) |p| {
-        try out.print(arena, "    .{{ {d}, {d} }},\n", .{ p[0], p[1] });
-    }
-    try out.appendSlice(arena, "};\n\n");
-
-    try out.print(arena, "pub const border_spans = [{d}]LineSpan{{\n", .{border_spans.items.len});
-    for (border_spans.items) |sp| {
-        try out.print(arena, "    .{{ .start = {d}, .len = {d} }},\n", .{ sp.start, sp.len });
-    }
-    try out.appendSlice(arena, "};\n\n");
-
-    try out.print(arena, "pub const country_labels = [{d}]CountryLabel{{\n", .{labels.items.len});
-    for (labels.items) |lbl| {
-        try out.print(arena, "    .{{ .name = \"{f}\", .lat = {d:.2}, .lon = {d:.2}, .rank = {d} }},\n", .{
-            std.zig.fmtString(lbl.name),
-            lbl.lat,
-            lbl.lon,
-            lbl.rank,
-        });
-    }
-    try out.appendSlice(arena, "};\n");
+    try writeDatasetArrays(arena, &out, "", lod_110m);
+    try writeDatasetArrays(arena, &out, "_50m", lod_50m);
 
     return out.toOwnedSlice(arena);
 }
@@ -546,6 +652,7 @@ fn internVert(
     arena: std.mem.Allocator,
     vert_map: *std.AutoHashMapUnmanaged(VertKey, u16),
     verts: *std.ArrayList(VertKey),
+    batch_vert_start: u32,
     lon: f64,
     lat: f64,
     color_idx: u8,
@@ -553,7 +660,7 @@ fn internVert(
     const qp = quantPt(lon, lat);
     const key = VertKey{ .lon_cd = qp[0], .lat_cd = qp[1], .color_idx = color_idx };
     if (vert_map.get(key)) |idx| return idx;
-    const idx: u16 = @intCast(verts.items.len);
+    const idx: u16 = @intCast(verts.items.len - batch_vert_start);
     try verts.append(arena, key);
     try vert_map.put(arena, key, idx);
     return idx;
@@ -611,15 +718,20 @@ fn processPolygon(
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
-    if (args.len != 3) {
-        std.debug.print("usage: mkmap <ne_110m_admin_0_countries.geojson> <map_data.zig>\n", .{});
+    if (args.len != 3 and args.len != 4) {
+        std.debug.print("usage: mkmap <ne_110m.geojson> [ne_50m.geojson] <map_data.zig>\n", .{});
         std.process.exit(2);
     }
     const cwd = std.Io.Dir.cwd();
-    const geojson = try cwd.readFileAlloc(init.io, args[1], arena, .limited(32 << 20));
-    const zig_src = try generate(arena, geojson);
+    const geojson_110m = try cwd.readFileAlloc(init.io, args[1], arena, .limited(32 << 20));
+    const geojson_50m = if (args.len == 4)
+        try cwd.readFileAlloc(init.io, args[2], arena, .limited(32 << 20))
+    else
+        geojson_110m;
+    const out_path = args[args.len - 1];
+    const zig_src = try generateTwoLod(arena, geojson_110m, geojson_50m);
 
-    const out_file = try cwd.createFile(init.io, args[2], .{});
+    const out_file = try cwd.createFile(init.io, out_path, .{});
     defer out_file.close(init.io);
     try out_file.writeStreamingAll(init.io, zig_src);
 }
