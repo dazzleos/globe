@@ -59,14 +59,7 @@ fn run(init: std.process.Init.Minimal, font_path: [*:0]const u8) !void {
 
     while (try a.step(100 * std.time.ns_per_ms)) {
         const frame_start = sys.nowNs();
-        for (a.win.takeInput()) |e| switch (e) {
-            .motion, .button, .scroll => {
-                a.ui.handleInput(e);
-                a.dirty = true;
-            },
-            .key, .relative_motion, .pointer_locked => {},
-            else => a.ui.handleInput(e),
-        };
+        a.takeInput();
 
         try a.draw(frame_start, view.Maps{
             .globe_gpu = &globe_gpu,

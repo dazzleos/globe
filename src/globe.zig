@@ -222,7 +222,8 @@ pub fn generateSphere(gpa: std.mem.Allocator, lat_segs: u32, lon_segs: u32) !Mes
 
         for (0..lon_segs + 1) |x| {
             const u = @as(f32, @floatFromInt(x)) / @as(f32, @floatFromInt(lon_segs));
-            const phi = u * 2.0 * std.math.pi; // 0 to 2*pi
+            // u = 0 is -180° (-pi), u = 0.5 is 0° Prime Meridian (+Z), u = 1 is +180° (+pi).
+            const phi = (u * 2.0 - 1.0) * std.math.pi;
             const sin_p = @sin(phi);
             const cos_p = @cos(phi);
 
@@ -297,12 +298,13 @@ pub const GlobeGpu = struct {
         @memcpy(ibo.map[0 .. mesh.indices.len * 2], std.mem.sliceAsBytes(mesh.indices));
 
         // Generate offline base map texture:
-        var pixels: [texture_w * texture_h]u32 = undefined;
-        map_data.renderBaseMap(&pixels, texture_w, texture_h);
+        const pixels = try gpa.alloc(u32, texture_w * texture_h);
+        defer gpa.free(pixels);
+        map_data.renderBaseMap(pixels, texture_w, texture_h);
 
         const texture = try dev.createBo(vc4.texture.imageSize(texture_w, texture_h));
         errdefer dev.destroyBo(texture);
-        vc4.texture.upload(texture.map, &pixels, texture_w, texture_h);
+        vc4.texture.upload(texture.map, pixels, texture_w, texture_h);
 
         return .{
             .pipeline = pipeline,
@@ -400,6 +402,16 @@ test "sphere mesh generation and globe shader validation" {
     try testing.expectEqual(@as(usize, 41 * 81), mesh.vertices.len);
     try testing.expectEqual(@as(usize, 40 * 80 * 6), mesh.indices.len);
     for (mesh.indices) |idx| try testing.expect(idx < mesh.vertices.len);
+
+    // Equator at Prime Meridian (u = 0.5, v = 0.5 -> y = 20, x = 40) must be at +Z (0, 0, 1),
+    // matching latLonToCartesian(0.0, 0.0, 1.0) and renderBaseMap's lon = u * 360 - 180 = 0.
+    const prime_eq = mesh.vertices[20 * 81 + 40];
+    try testing.expectApproxEqAbs(@as(f32, 0.5), prime_eq.uv[0], 1e-5);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), prime_eq.uv[1], 1e-5);
+    const expected = latLonToCartesian(0.0, 0.0, 1.0);
+    try testing.expectApproxEqAbs(expected[0], prime_eq.pos[0], 1e-5);
+    try testing.expectApproxEqAbs(expected[1], prime_eq.pos[1], 1e-5);
+    try testing.expectApproxEqAbs(expected[2], prime_eq.pos[2], 1e-5);
 
     const prog = try shader.Program.decode(@embedFile("globe.shader"));
     for ([_]vc4.compiler.Compiled{ prog.fs, prog.vs, prog.cs }) |c| {

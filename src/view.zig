@@ -601,8 +601,8 @@ pub const GlobeView = struct {
             c.fillCircle(.{ center_x, center_y }, r, gfx.Color.rgb(0x1a3856));
         }
 
-        // Vector Overlays on Canvas:
-        self.paintOverlays(w, h, c);
+        // Vector Overlays on Canvas (drawn in a new canvas segment on top of the 3D globe):
+        self.paintOverlays(w, h, p.canvas());
     }
 
     fn drawGlobe(self: *const GlobeView, frame: *vc4.render.Frame, area: ui.GpuArea) anyerror!void {
@@ -616,9 +616,21 @@ pub const GlobeView = struct {
         const view = globe.mul(view_trans, rot);
         const mvp = globe.mul(proj, view);
 
-        // Sun direction (towards sun in model space):
+        // Sun direction (towards sun in view/world space):
         const sun_dir = [3]f32{ -0.6, 0.4, 0.7 };
-        const cam_pos = [3]f32{ 0, 0, self.state.distance };
+
+        // Camera position in model space (eye is [0, 0, distance] in view space, inverse-rotated by rot):
+        const cos_p = @cos(-self.state.pitch);
+        const sin_p = @sin(-self.state.pitch);
+        const d = self.state.distance;
+        const eye_pitch = [3]f32{ 0, -d * sin_p, d * cos_p };
+        const cos_y = @cos(-self.state.yaw);
+        const sin_y = @sin(-self.state.yaw);
+        const cam_pos = [3]f32{
+            eye_pitch[0] * cos_y + eye_pitch[2] * sin_y,
+            eye_pitch[1],
+            -eye_pitch[0] * sin_y + eye_pitch[2] * cos_y,
+        };
 
         try self.maps.globe_gpu.?.draw(
             frame,
