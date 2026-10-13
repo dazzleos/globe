@@ -1,44 +1,36 @@
-//! The Maps window, as widgets: the 3D interactive globe filling the window,
-//! with vector geographic overlays (coastlines, country borders, graticule,
-//! cities/capitals), an educational inspector card, continent quick-jump chips,
-//! and layers control panel.
+//! The Maps window, as widgets: a clean, interactive 3D political globe
+//! rendered with Natural Earth vectors, MapLibre globe colors, country
+//! boundaries, coastlines, and labels, with a top-right fullscreen toggle.
 
 const std = @import("std");
+const app = @import("app");
 const ui = @import("ui");
 const gfx = @import("gfx");
+const font = @import("font");
 const vc4 = @import("vc4");
-const locale = @import("locale");
-const map_data = @import("map_data.zig");
+const map_data = @import("map_data");
 const globe = @import("globe.zig");
-const tiles = @import("tiles.zig");
 
 pub const min_size = [2]u32{ 640, 420 };
 pub const open_size = [2]u32{ 1024, 680 };
 
-pub const text_color = gfx.Color.argb(0xfff0f4fa);
-pub const dim_color = gfx.Color.argb(0xff9ab0cc);
-pub const accent_color = gfx.Color.argb(0xff4ca0e8);
-pub const gold_color = gfx.Color.argb(0xffe8a838);
-pub const card_bg = gfx.Color.argb(0xec142236);
-pub const chip_bg = gfx.Color.argb(0xd0182840);
+pub const button_bg = gfx.Color.argb(0xd8182232);
+pub const label_color = gfx.Color.argb(0xff202834);
+pub const label_halo_color = gfx.Color.argb(0xd8ffffff);
 
 pub const Maps = struct {
     globe_gpu: ?*globe.GlobeGpu = null,
-    tile_manager: *tiles.TileManager,
     on_close: ?ui.Callback = null,
     on_maximize: ?ui.Callback = null,
+    on_fullscreen: ?ui.Callback = null,
     on_drag: ?ui.Callback = null,
     maximized: bool = true,
-    width: f32 = 1280,
+    fullscreen: bool = false,
 
     pub const State = struct {
         yaw: f32 = 0.2, // ~11° East (Europe/Africa centered initially)
         pitch: f32 = 0.25, // ~14° North
         distance: f32 = 2.5, // Space orbit view
-
-        target_yaw: ?f32 = null,
-        target_pitch: ?f32 = null,
-        target_distance: ?f32 = null,
 
         drag_vel_x: f32 = 0,
         drag_vel_y: f32 = 0,
@@ -46,84 +38,12 @@ pub const Maps = struct {
         last_pointer: ?[2]f32 = null,
         last_frame_ns: ?u64 = null,
 
-        auto_rotate: bool = false,
-        day_night_lighting: bool = true,
-        atmosphere_glow: bool = true,
-        show_graticule: bool = true,
-        show_borders: bool = true,
-        show_cities: bool = true,
-        show_layers_panel: bool = false,
-
-        selected_city: ?map_data.City = null,
-        hover_city: ?map_data.City = null,
-
         pub fn zoomIn(s: *State) void {
-            s.distance = @max(s.distance * 0.82, 1.25);
-            s.target_distance = null;
+            s.distance = @max(s.distance * 0.88, 1.30);
         }
 
         pub fn zoomOut(s: *State) void {
-            s.distance = @min(s.distance * 1.20, 5.0);
-            s.target_distance = null;
-        }
-
-        pub fn resetView(s: *State) void {
-            s.target_yaw = 0.2;
-            s.target_pitch = 0.25;
-            s.target_distance = 2.5;
-            s.selected_city = null;
-        }
-
-        pub fn toggleAutoRotate(s: *State) void {
-            s.auto_rotate = !s.auto_rotate;
-        }
-
-        pub fn toggleDayNight(s: *State, on: bool) void {
-            s.day_night_lighting = on;
-        }
-
-        pub fn toggleAtmosphere(s: *State, on: bool) void {
-            s.atmosphere_glow = on;
-        }
-
-        pub fn toggleGraticule(s: *State, on: bool) void {
-            s.show_graticule = on;
-        }
-
-        pub fn toggleBorders(s: *State, on: bool) void {
-            s.show_borders = on;
-        }
-
-        pub fn toggleCities(s: *State, on: bool) void {
-            s.show_cities = on;
-        }
-
-        pub fn toggleLayers(s: *State) void {
-            s.show_layers_panel = !s.show_layers_panel;
-        }
-
-        pub fn closeDetailCard(s: *State) void {
-            s.selected_city = null;
-        }
-
-        pub fn flyToCity(s: *State, c: map_data.City) void {
-            s.selected_city = c;
-            // Target yaw and pitch to center on this city:
-            // City lon in degrees to yaw in radians:
-            const lon_rad = c.lon * (std.math.pi / 180.0);
-            const lat_rad = c.lat * (std.math.pi / 180.0);
-            s.target_yaw = -lon_rad;
-            s.target_pitch = lat_rad;
-            s.target_distance = 1.6; // Zoom closer to city
-        }
-
-        pub fn flyToContinent(s: *State, cont: map_data.Continent) void {
-            s.selected_city = null;
-            const lon_rad = cont.center.lon * (std.math.pi / 180.0);
-            const lat_rad = cont.center.lat * (std.math.pi / 180.0);
-            s.target_yaw = -lon_rad;
-            s.target_pitch = lat_rad;
-            s.target_distance = cont.zoom_distance;
+            s.distance = @min(s.distance * 1.14, 4.8);
         }
     };
 
@@ -135,117 +55,51 @@ pub const Maps = struct {
             0.016;
         state.last_frame_ns = now;
 
-        // Smooth camera interpolation towards target if flying:
-        var animating = false;
-        if (state.target_yaw) |ty| {
-            animating = true;
-            // Shortest angle difference:
-            var diff = ty - state.yaw;
-            while (diff > std.math.pi) diff -= 2.0 * std.math.pi;
-            while (diff < -std.math.pi) diff += 2.0 * std.math.pi;
-            if (@abs(diff) < 0.005) {
-                state.yaw = ty;
-                state.target_yaw = null;
-            } else {
-                state.yaw += diff * @min(dt * 6.0, 1.0);
-            }
-        }
-        if (state.target_pitch) |tp| {
-            animating = true;
-            const diff = tp - state.pitch;
-            if (@abs(diff) < 0.005) {
-                state.pitch = tp;
-                state.target_pitch = null;
-            } else {
-                state.pitch += diff * @min(dt * 6.0, 1.0);
-            }
-        }
-        if (state.target_distance) |td| {
-            animating = true;
-            const diff = td - state.distance;
-            if (@abs(diff) < 0.01) {
-                state.distance = td;
-                state.target_distance = null;
-            } else {
-                state.distance += diff * @min(dt * 6.0, 1.0);
-            }
-        }
-
-        // Inertia when not dragging:
-        if (!state.is_dragging and !animating) {
+        // Smooth inertia after mouse release:
+        if (!state.is_dragging) {
             if (@abs(state.drag_vel_x) > 0.001 or @abs(state.drag_vel_y) > 0.001) {
                 state.yaw += state.drag_vel_x * dt;
                 state.pitch = std.math.clamp(state.pitch + state.drag_vel_y * dt, -1.45, 1.45);
-                state.drag_vel_x *= @exp(-dt * 4.0); // Friction decay
-                state.drag_vel_y *= @exp(-dt * 4.0);
-                cx.requestFrame();
-            } else if (state.auto_rotate) {
-                state.yaw += dt * 0.12; // Serene auto-rotation
+                state.drag_vel_x *= @exp(-dt * 5.0);
+                state.drag_vel_y *= @exp(-dt * 5.0);
                 cx.requestFrame();
             }
         }
 
-        if (animating) cx.requestFrame();
+        const is_fullscreen = self.fullscreen or cx.ui.fullscreen;
+        const on_fullscreen = self.on_fullscreen orelse
+            if (cx.ui.controls) |c| ui.Callback.of(c, app.Controls.toggleFullscreen) else null;
 
         const a = cx.ui.arena();
         var layers: std.ArrayList(ui.Widget) = .empty;
 
-        // 1. Globe 3D view (fills background)
+        // 1. 3D Political Vector Globe (fills background, clipped to bounds)
         layers.append(a, cx.make(GlobeView{
             .maps = self,
             .state = state,
         })) catch {};
 
-        // 2. Top Bar: Continent Chips & Quick Jump
+        // 2. Top-Right Fullscreen Toggle Button
         layers.append(a, cx.make(ui.Align{
-            .alignment = .top_left,
+            .alignment = .top_right,
             .child = cx.make(ui.Padding{
-                .padding = .{ .left = 16, .top = 12, .right = 16 },
-                .child = self.topBar(cx, state),
-            }),
-        })) catch {};
-
-        // 3. Floating Action Buttons (Right Side)
-        layers.append(a, cx.make(ui.Align{
-            .alignment = .center_right,
-            .child = cx.make(ui.Padding{
-                .padding = .{ .right = 16 },
-                .child = self.floatingControls(cx, state),
-            }),
-        })) catch {};
-
-        // 4. Bottom HUD: Coordinates & Information
-        layers.append(a, cx.make(ui.Align{
-            .alignment = .bottom_left,
-            .child = cx.make(ui.Padding{
-                .padding = .{ .left = 16, .bottom = 12, .right = 16 },
-                .child = self.bottomHud(cx, state),
-            }),
-        })) catch {};
-
-        // 5. Educational Detail Card (if city selected)
-        if (state.selected_city) |city| {
-            layers.append(a, cx.make(ui.Align{
-                .alignment = .top_right,
-                .child = cx.make(ui.Padding{
-                    .padding = .{ .right = 16, .top = 56 },
-                    .child = self.educationalCard(cx, state, city),
+                .padding = .{ .top = 12, .right = 12 },
+                .child = cx.make(ui.Decorated{
+                    .color = button_bg,
+                    .radius = gfx.Radii.all(20),
+                    .child = cx.make(ui.IconButton{
+                        .icon = if (is_fullscreen) .fullscreen_exit else .fullscreen,
+                        .on_press = on_fullscreen,
+                    }),
                 }),
-            })) catch {};
-        }
-
-        // 6. Layers Settings Drawer (if toggled)
-        if (state.show_layers_panel) {
-            layers.append(a, cx.make(ui.Align{
-                .alignment = .top_left,
-                .child = cx.make(ui.Padding{
-                    .padding = .{ .left = 16, .top = 56 },
-                    .child = self.layersPanel(cx, state),
-                }),
-            })) catch {};
-        }
+            }),
+        })) catch {};
 
         const content = cx.make(ui.Overlay{ .children = layers.items });
+
+        if (is_fullscreen) {
+            return content;
+        }
 
         return cx.make(ui.Column{
             .cross_axis_alignment = .stretch,
@@ -261,295 +115,12 @@ pub const Maps = struct {
             },
         });
     }
-
-    fn topBar(self: *const Maps, cx: *ui.Context, state: *State) ui.Widget {
-        var chips: std.ArrayList(ui.Widget) = .empty;
-        const a = cx.ui.arena();
-
-        chips.append(a, cx.make(ui.OutlinedButton{
-            .label = "Layers",
-            .icon = .layers,
-            .on_press = .of(state, State.toggleLayers),
-        })) catch {};
-
-        // Choose how many continents to display based on window width so they never overflow
-        const cont_count: usize = if (self.width >= 1150)
-            map_data.continents.len
-        else if (self.width >= 950)
-            6
-        else if (self.width >= 720)
-            5
-        else
-            4;
-
-        for (map_data.continents[0..@min(cont_count, map_data.continents.len)]) |cont| {
-            const Jump = struct {
-                s: *State,
-                c: map_data.Continent,
-                fn call(j: *@This()) void {
-                    j.s.flyToContinent(j.c);
-                }
-            };
-            const j_ptr = a.create(Jump) catch continue;
-            j_ptr.* = .{ .s = state, .c = cont };
-            chips.append(a, cx.make(ui.Chip{
-                .label = cont.name,
-                .on_press = .of(j_ptr, Jump.call),
-            })) catch {};
-        }
-
-        return cx.make(ui.Row{
-            .main_axis_size = .min,
-            .spacing = 8,
-            .children = chips.items,
-        });
-    }
-
-    fn floatingControls(self: *const Maps, cx: *ui.Context, state: *State) ui.Widget {
-        _ = self;
-        return cx.make(ui.Decorated{
-            .color = card_bg,
-            .radius = gfx.Radii.all(12),
-            .child = cx.make(ui.Padding{
-                .padding = .all(8),
-                .child = cx.make(ui.Column{
-                    .main_axis_size = .min,
-                    .spacing = 8,
-                    .children = &.{
-                        cx.make(ui.OutlinedButton{
-                            .label = "+",
-                            .icon = .zoom_in,
-                            .on_press = .of(state, State.zoomIn),
-                        }),
-                        cx.make(ui.OutlinedButton{
-                            .label = "-",
-                            .icon = .zoom_out,
-                            .on_press = .of(state, State.zoomOut),
-                        }),
-                        cx.make(ui.OutlinedButton{
-                            .label = if (state.auto_rotate) "Pause" else "Spin",
-                            .icon = if (state.auto_rotate) .pause else .play_arrow,
-                            .on_press = .of(state, State.toggleAutoRotate),
-                        }),
-                        cx.make(ui.OutlinedButton{
-                            .label = "Reset",
-                            .icon = .my_location,
-                            .on_press = .of(state, State.resetView),
-                        }),
-                    },
-                }),
-            }),
-        });
-    }
-
-    fn bottomHud(self: *const Maps, cx: *ui.Context, state: *State) ui.Widget {
-        // Calculate center coordinate from camera rotation:
-        const center_lat = state.pitch * (180.0 / std.math.pi);
-        const center_lon = -state.yaw * (180.0 / std.math.pi);
-        const alt_km = @as(u32, @intFromFloat(@max(state.distance - 1.0, 0.1) * 6371.0));
-
-        var status_buf: [64]u8 = undefined;
-        const net_status = self.tile_manager.statusText(&status_buf);
-
-        const lat_str = if (center_lat >= 0)
-            cx.fmt("{d:.1}° N", .{center_lat})
-        else
-            cx.fmt("{d:.1}° S", .{-center_lat});
-
-        var lon_wrapped = center_lon;
-        while (lon_wrapped > 180.0) lon_wrapped -= 360.0;
-        while (lon_wrapped < -180.0) lon_wrapped += 360.0;
-        const lon_str = if (lon_wrapped >= 0)
-            cx.fmt("{d:.1}° E", .{lon_wrapped})
-        else
-            cx.fmt("{d:.1}° W", .{-lon_wrapped});
-
-        const info = cx.fmt("{s}, {s}  ·  Altitude: {d} km  ·  {s}", .{
-            lat_str,
-            lon_str,
-            alt_km,
-            net_status,
-        });
-
-        return cx.make(ui.Decorated{
-            .color = card_bg,
-            .radius = gfx.Radii.all(10),
-            .child = cx.make(ui.Padding{
-                .padding = .{ .left = 14, .right = 14, .top = 8, .bottom = 8 },
-                .child = cx.make(ui.Text{
-                    .text = info,
-                    .style = .{ .size = 14, .color = text_color },
-                    .wrap = false,
-                }),
-            }),
-        });
-    }
-
-    fn educationalCard(self: *const Maps, cx: *ui.Context, state: *State, city: map_data.City) ui.Widget {
-        _ = self;
-        const Fly = struct {
-            s: *State,
-            c: map_data.City,
-            fn call(f: *@This()) void {
-                f.s.flyToCity(f.c);
-            }
-        };
-        const fly_ptr = cx.ui.arena().create(Fly) catch return cx.make(ui.Empty{});
-        fly_ptr.* = .{ .s = state, .c = city };
-
-        const coord_str = cx.fmt("{d:.2}° {s}, {d:.2}° {s}", .{
-            @abs(city.lat),
-            if (city.lat >= 0) "N" else "S",
-            @abs(city.lon),
-            if (city.lon >= 0) "E" else "W",
-        });
-
-        return cx.make(ui.Decorated{
-            .color = card_bg,
-            .radius = gfx.Radii.all(14),
-            .child = cx.make(ui.ConstrainedBox{
-                .constraints = .{ .min_w = 320, .max_w = 380 },
-                .child = cx.make(ui.Padding{
-                    .padding = .all(18),
-                    .child = cx.make(ui.Column{
-                        .main_axis_size = .min,
-                        .cross_axis_alignment = .start,
-                        .spacing = 8,
-                        .children = &.{
-                            cx.make(ui.Row{
-                                .cross_axis_alignment = .center,
-                                .children = &.{
-                                    cx.make(ui.Expanded{
-                                        .child = cx.make(ui.Text{
-                                            .text = city.name,
-                                            .style = .{ .size = 22, .color = text_color },
-                                            .wrap = false,
-                                        }),
-                                    }),
-                                    cx.make(ui.IconButton{
-                                        .icon = .close,
-                                        .on_press = .of(state, State.closeDetailCard),
-                                    }),
-                                },
-                            }),
-                            cx.make(ui.Text{
-                                .text = cx.fmt("{s}  ·  {s}", .{ city.country, city.continent }),
-                                .style = .{ .size = 15, .color = accent_color },
-                                .wrap = false,
-                            }),
-                            cx.make(ui.SizedBox{ .height = 4 }),
-                            cx.make(ui.Text{
-                                .text = cx.fmt("Coordinates: {s}", .{coord_str}),
-                                .style = .{ .size = 13, .color = dim_color },
-                                .wrap = false,
-                            }),
-                            cx.make(ui.Text{
-                                .text = cx.fmt("Population: {s}", .{city.population}),
-                                .style = .{ .size = 13, .color = dim_color },
-                                .wrap = false,
-                            }),
-                            cx.make(ui.SizedBox{ .height = 6 }),
-                            cx.make(ui.Text{
-                                .text = city.fact,
-                                .style = .{ .size = 14, .color = text_color },
-                                .wrap = true,
-                            }),
-                            cx.make(ui.SizedBox{ .height = 10 }),
-                            cx.make(ui.Row{
-                                .spacing = 8,
-                                .main_axis_size = .min,
-                                .children = &.{
-                                    cx.make(ui.OutlinedButton{
-                                        .label = "Fly Closer",
-                                        .icon = .my_location,
-                                        .on_press = .of(fly_ptr, Fly.call),
-                                    }),
-                                },
-                            }),
-                        },
-                    }),
-                }),
-            }),
-        });
-    }
-
-    fn layersPanel(self: *const Maps, cx: *ui.Context, state: *State) ui.Widget {
-        const ToggleTiles = struct {
-            m: *tiles.TileManager,
-            fn call(t: *@This(), on: bool) void {
-                t.m.enabled = on;
-            }
-        };
-        const tile_toggle = cx.ui.arena().create(ToggleTiles) catch return cx.make(ui.Empty{});
-        tile_toggle.* = .{ .m = self.tile_manager };
-
-        return cx.make(ui.Decorated{
-            .color = card_bg,
-            .radius = gfx.Radii.all(14),
-            .child = cx.make(ui.ConstrainedBox{
-                .constraints = .{ .min_w = 280, .max_w = 340 },
-                .child = cx.make(ui.Padding{
-                    .padding = .all(18),
-                    .child = cx.make(ui.Column{
-                        .main_axis_size = .min,
-                        .cross_axis_alignment = .start,
-                        .spacing = 10,
-                        .children = &.{
-                            cx.make(ui.Row{
-                                .children = &.{
-                                    cx.make(ui.Expanded{
-                                        .child = cx.make(ui.Text{
-                                            .text = "Map Layers",
-                                            .style = .{ .size = 18, .color = text_color },
-                                            .wrap = false,
-                                        }),
-                                    }),
-                                    cx.make(ui.IconButton{
-                                        .icon = .close,
-                                        .on_press = .of(state, State.toggleLayers),
-                                    }),
-                                },
-                            }),
-                            cx.make(ui.Switch{
-                                .value = state.day_night_lighting,
-                                .on_changed = .of(state, State.toggleDayNight),
-                                .label = "Day & Night Lighting",
-                            }),
-                            cx.make(ui.Switch{
-                                .value = state.atmosphere_glow,
-                                .on_changed = .of(state, State.toggleAtmosphere),
-                                .label = "Atmosphere Glow",
-                            }),
-                            cx.make(ui.Switch{
-                                .value = state.show_graticule,
-                                .on_changed = .of(state, State.toggleGraticule),
-                                .label = "Lat/Lon Graticule Grid",
-                            }),
-                            cx.make(ui.Switch{
-                                .value = state.show_borders,
-                                .on_changed = .of(state, State.toggleBorders),
-                                .label = "Coastlines & Borders",
-                            }),
-                            cx.make(ui.Switch{
-                                .value = state.show_cities,
-                                .on_changed = .of(state, State.toggleCities),
-                                .label = "Capitals & Cities",
-                            }),
-                            cx.make(ui.Switch{
-                                .value = self.tile_manager.enabled,
-                                .on_changed = .of(tile_toggle, ToggleTiles.call),
-                                .label = "Remote Tiles (OSM)",
-                            }),
-                        },
-                    }),
-                }),
-            }),
-        });
-    }
 };
 
-/// Widget rendering the 3D Globe and its vector overlays.
+/// Widget rendering the 3D Vector Globe and its coastline, boundary, and label overlays.
 pub const GlobeView = struct {
+    pub const clips_children = true;
+
     maps: *const Maps,
     state: *Maps.State,
 
@@ -563,46 +134,40 @@ pub const GlobeView = struct {
         const h = n.size.h;
         if (w <= 1 or h <= 1) return;
 
-        // Space background with subtle stars:
-        const c = p.canvas();
-        c.fillRect(.{ .x = 0, .y = 0, .w = w, .h = h }, gfx.Color.rgb(0x060c18));
+        // 1. Background canvas (rendered BEFORE the 3D GPU globe):
+        const bg_c = p.canvas();
+        bg_c.fillRect(.{ .x = 0, .y = 0, .w = w, .h = h }, gfx.Color.rgb(0x0b101b));
 
-        // Atmospheric outer glow halo:
-        if (self.state.atmosphere_glow) {
-            const fovy = 45.0 * (std.math.pi / 180.0);
-            const tan_fov = @tan(fovy * 0.5);
-            // Screen radius of globe sphere:
-            const sphere_screen_r = (h * 0.5) / (tan_fov * self.state.distance);
-            const center_x = w * 0.5;
-            const center_y = h * 0.5;
+        const fovy = 45.0 * (std.math.pi / 180.0);
+        const tan_fov = @tan(fovy * 0.5);
+        const sphere_screen_r = (h * 0.5) / (tan_fov * self.state.distance);
+        const center_x = w * 0.5;
+        const center_y = h * 0.5;
 
-            if (sphere_screen_r > 5) {
-                // Outer cyan halo rings fading out:
-                c.fillCircle(.{ center_x, center_y }, sphere_screen_r * 1.055, gfx.Color.argb(0x183ca0e8));
-                c.fillCircle(.{ center_x, center_y }, sphere_screen_r * 1.030, gfx.Color.argb(0x284cb5f0));
-            }
+        if (sphere_screen_r > 5) {
+            bg_c.fillCircle(.{ center_x, center_y }, sphere_screen_r * 1.035, gfx.Color.argb(0x1868b8f8));
+            bg_c.fillCircle(.{ center_x, center_y }, sphere_screen_r * 1.015, gfx.Color.argb(0x2890d4ff));
         }
 
-        // 3D GPU Globe draw:
+        // 2. 3D GPU Vector Globe (Ocean sphere + Natural Earth country polygons):
         if (self.maps.globe_gpu) |_| {
             var key = std.hash.Wyhash.init(0);
             key.update(std.mem.asBytes(&self.state.yaw));
             key.update(std.mem.asBytes(&self.state.pitch));
             key.update(std.mem.asBytes(&self.state.distance));
-            key.update(std.mem.asBytes(&self.state.day_night_lighting));
-            key.update(std.mem.asBytes(&self.state.atmosphere_glow));
 
             p.gpuWith(.{ .key = key.final() }, self, drawGlobe);
         } else {
-            // Software preview circle for host tests without GPU:
-            const center_x = w * 0.5;
-            const center_y = h * 0.5;
-            const r = @min(w, h) * 0.38;
-            c.fillCircle(.{ center_x, center_y }, r, gfx.Color.rgb(0x1a3856));
+            // Software fallback circle for headless host tests without GPU:
+            if (sphere_screen_r > 5) {
+                bg_c.fillCircle(.{ center_x, center_y }, sphere_screen_r, gfx.Color.argb(map_data.ocean_color));
+            }
         }
 
-        // Vector Overlays on Canvas (drawn in a new canvas segment on top of the 3D globe):
-        self.paintOverlays(w, h, p.canvas());
+        // 3. Foreground overlay canvas (acquired AFTER p.gpuWith so coastlines,
+        // borders, and country labels render ON TOP of the 3D GPU globe):
+        const fg_c = p.canvas();
+        self.paintOverlays(w, h, fg_c, p);
     }
 
     fn drawGlobe(self: *const GlobeView, frame: *vc4.render.Frame, area: ui.GpuArea) anyerror!void {
@@ -616,48 +181,7 @@ pub const GlobeView = struct {
         const view = globe.mul(view_trans, rot);
         const mvp = globe.mul(proj, view);
 
-        // Sun direction (towards sun in view/world space):
-        const sun_dir = [3]f32{ -0.6, 0.4, 0.7 };
-
-        // Camera position in model space (eye is [0, 0, distance] in view space, inverse-rotated by rot):
-        const cos_p = @cos(-self.state.pitch);
-        const sin_p = @sin(-self.state.pitch);
-        const d = self.state.distance;
-        const eye_pitch = [3]f32{ 0, -d * sin_p, d * cos_p };
-        const cos_y = @cos(-self.state.yaw);
-        const sin_y = @sin(-self.state.yaw);
-        const cam_pos = [3]f32{
-            eye_pitch[0] * cos_y + eye_pitch[2] * sin_y,
-            eye_pitch[1],
-            -eye_pitch[0] * sin_y + eye_pitch[2] * cos_y,
-        };
-
-        try self.maps.globe_gpu.?.draw(
-            frame,
-            area.viewport,
-            area.scissor,
-            mvp,
-            rot,
-            sun_dir,
-            self.state.day_night_lighting,
-            cam_pos,
-            self.state.atmosphere_glow,
-        );
-    }
-
-    fn paintOverlays(self: *const GlobeView, w: f32, h: f32, c: *gfx.Canvas) void {
-        const aspect = w / h;
-        const proj = globe.perspective(45.0 * (std.math.pi / 180.0), aspect, 0.1, 20.0);
-        const view_trans = globe.translation(0, 0, -self.state.distance);
-        const rot_x = globe.rotationX(self.state.pitch);
-        const rot_y = globe.rotationY(self.state.yaw);
-        const rot = globe.mul(rot_x, rot_y);
-        const view = globe.mul(view_trans, rot);
-        const mvp = globe.mul(proj, view);
-
-        // Camera position in model space:
-        // Eye is [0, 0, distance] in world space; inverse-rotate by rot:
-        // inv(rot) = inv(rot_y) * inv(rot_x)
+        // Camera position in model space for view-dependent limb shading:
         const cos_p = @cos(-self.state.pitch);
         const sin_p = @sin(-self.state.pitch);
         const d = self.state.distance;
@@ -670,155 +194,198 @@ pub const GlobeView = struct {
             -eye_pitch[0] * sin_y + eye_pitch[2] * cos_y,
         };
 
-        // 1. Graticule Lines (Equator, Prime Meridian, Tropics):
-        if (self.state.show_graticule) {
-            for (map_data.graticules) |gr| {
-                const color = switch (gr.kind) {
-                    .equator => gfx.Color.argb(0xa0e0a838),
-                    .prime_meridian => gfx.Color.argb(0x904ca8d8),
-                    .tropic => gfx.Color.argb(0x507090b8),
-                    .polar => gfx.Color.argb(0x5090b0d8),
-                    .grid => gfx.Color.argb(0x306080a0),
+        const sun_dir = [3]f32{ -0.4, 0.3, 0.85 };
+
+        try self.maps.globe_gpu.?.draw(
+            frame,
+            area.viewport,
+            area.scissor,
+            mvp,
+            rot,
+            sun_dir,
+            cam_model,
+        );
+    }
+
+    fn paintOverlays(self: *const GlobeView, w: f32, h: f32, c: *gfx.Canvas, p: *ui.Painter) void {
+        const aspect = w / h;
+        const proj = globe.perspective(45.0 * (std.math.pi / 180.0), aspect, 0.1, 20.0);
+        const view_trans = globe.translation(0, 0, -self.state.distance);
+        const rot_x = globe.rotationX(self.state.pitch);
+        const rot_y = globe.rotationY(self.state.yaw);
+        const rot = globe.mul(rot_x, rot_y);
+        const view = globe.mul(view_trans, rot);
+        const mvp = globe.mul(proj, view);
+
+        // Camera position in model space:
+        const cos_p = @cos(-self.state.pitch);
+        const sin_p = @sin(-self.state.pitch);
+        const d = self.state.distance;
+        const eye_pitch = [3]f32{ 0, -d * sin_p, d * cos_p };
+        const cos_y = @cos(-self.state.yaw);
+        const sin_y = @sin(-self.state.yaw);
+        const cam_model = [3]f32{
+            eye_pitch[0] * cos_y + eye_pitch[2] * sin_y,
+            eye_pitch[1],
+            -eye_pitch[0] * sin_y + eye_pitch[2] * cos_y,
+        };
+
+        // 1. In CPU-only preview mode (no GPU), draw 2D projected country polygons
+        // so unit tests and CPU previews show the political map as well:
+        if (self.maps.globe_gpu == null) {
+            var ii: usize = 0;
+            while (ii + 2 < map_data.country_indices.len) : (ii += 3) {
+                const v0 = map_data.country_vertices[map_data.country_indices[ii]];
+                const v1 = map_data.country_vertices[map_data.country_indices[ii + 1]];
+                const v2 = map_data.country_vertices[map_data.country_indices[ii + 2]];
+
+                const p0 = globe.latLonToCartesian(@as(f32, @floatFromInt(v0.lat_cd)) * 0.01, @as(f32, @floatFromInt(v0.lon_cd)) * 0.01, 1.0);
+                const p1 = globe.latLonToCartesian(@as(f32, @floatFromInt(v1.lat_cd)) * 0.01, @as(f32, @floatFromInt(v1.lon_cd)) * 0.01, 1.0);
+                const p2 = globe.latLonToCartesian(@as(f32, @floatFromInt(v2.lat_cd)) * 0.01, @as(f32, @floatFromInt(v2.lon_cd)) * 0.01, 1.0);
+
+                if (globe.project(p0, mvp, cam_model, w, h)) |s0| {
+                    if (globe.project(p1, mvp, cam_model, w, h)) |s1| {
+                        if (globe.project(p2, mvp, cam_model, w, h)) |s2| {
+                            const pidx = @min(v0.color_idx, @as(u8, @intCast(map_data.country_palette.len - 1)));
+                            const col = gfx.Color.argb(map_data.country_palette[pidx]);
+                            c.fillPolygon(&.{ .{ s0[0], s0[1] }, .{ s1[0], s1[1] }, .{ s2[0], s2[1] } }, col);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Coastlines (#198EC8 from MapLibre globe style):
+        const coast_col = gfx.Color.argb(map_data.coastline_color);
+        drawProjectedSpans(c, &map_data.coastline_points, &map_data.coastline_spans, mvp, cam_model, w, h, 1.2, coast_col);
+
+        // 3. International Country Boundaries (#FFFFFF from MapLibre globe style):
+        const border_col = gfx.Color.argb(map_data.boundary_color);
+        drawProjectedSpans(c, &map_data.border_points, &map_data.border_spans, mvp, cam_model, w, h, 1.3, border_col);
+
+        // 4. Country Name Labels (decluttered by zoom level and screen-space bounding boxes):
+        const max_rank: u8 = if (self.state.distance > 3.0)
+            2
+        else if (self.state.distance > 2.2)
+            3
+        else if (self.state.distance > 1.7)
+            4
+        else
+            6;
+
+        const norm_cam_len = @sqrt(cam_model[0] * cam_model[0] + cam_model[1] * cam_model[1] + cam_model[2] * cam_model[2]);
+        const inv_cam_len = if (norm_cam_len > 1e-4) 1.0 / norm_cam_len else 1.0;
+        const cam_dir = [3]f32{
+            cam_model[0] * inv_cam_len,
+            cam_model[1] * inv_cam_len,
+            cam_model[2] * inv_cam_len,
+        };
+
+        var placed_boxes: [64]gfx.Rect = undefined;
+        var placed_count: usize = 0;
+
+        for (map_data.country_labels) |lbl| {
+            if (lbl.rank > max_rank) continue;
+            if (placed_count >= placed_boxes.len) break;
+
+            const p3 = globe.latLonToCartesian(lbl.lat, lbl.lon, 1.004);
+            // Skip labels near the limb where text would look foreshortened:
+            const facing = p3[0] * cam_dir[0] + p3[1] * cam_dir[1] + p3[2] * cam_dir[2];
+            if (facing < 0.32) continue;
+
+            if (globe.project(p3, mvp, cam_model, w, h)) |scr| {
+                const f = p.ui.font orelse continue;
+                const font_size: f32 = if (lbl.rank <= 2) 13.0 else if (lbl.rank == 3) 11.5 else 10.5;
+                const style: font.Style = .{ .font = f, .size = font_size };
+                const text_w = p.ui.atlas.runs.measure(style, lbl.name);
+                const text_h = style.lineHeight();
+                const lx = scr[0] - text_w * 0.5;
+                const ly = scr[1] - text_h * 0.5;
+                const box = gfx.Rect{
+                    .x = lx - 6,
+                    .y = ly - 3,
+                    .w = text_w + 12,
+                    .h = text_h + 6,
                 };
 
-                var pts: [65]gfx.Point = undefined;
-                var count: usize = 0;
+                // Keep labels inside viewport margins:
+                if (box.x < 8 or box.y < 8 or box.x + box.w > w - 8 or box.y + box.h > h - 8) continue;
 
-                if (gr.lat) |lat| {
-                    // Parallel ring:
-                    var i: u32 = 0;
-                    while (i <= 64) : (i += 1) {
-                        const lon = @as(f32, @floatFromInt(i)) / 64.0 * 360.0 - 180.0;
-                        const p3 = globe.latLonToCartesian(lat, lon, 1.001);
-                        if (globe.project(p3, mvp, cam_model, w, h)) |scr| {
-                            pts[count] = .{ scr[0], scr[1] };
-                            count += 1;
-                        } else {
-                            if (count >= 2) {
-                                c.strokePolyline(pts[0..count], false, 1.2, color);
-                            }
-                            count = 0;
-                        }
-                    }
-                    if (count >= 2) {
-                        c.strokePolyline(pts[0..count], false, 1.2, color);
-                    }
-                } else if (gr.lon) |lon| {
-                    // Meridian line:
-                    var i: u32 = 0;
-                    while (i <= 64) : (i += 1) {
-                        const lat = @as(f32, @floatFromInt(i)) / 64.0 * 180.0 - 90.0;
-                        const p3 = globe.latLonToCartesian(lat, lon, 1.001);
-                        if (globe.project(p3, mvp, cam_model, w, h)) |scr| {
-                            pts[count] = .{ scr[0], scr[1] };
-                            count += 1;
-                        } else {
-                            if (count >= 2) {
-                                c.strokePolyline(pts[0..count], false, 1.2, color);
-                            }
-                            count = 0;
-                        }
-                    }
-                    if (count >= 2) {
-                        c.strokePolyline(pts[0..count], false, 1.2, color);
+                // Screen-space collision check to prevent overlapping country names:
+                var overlaps = false;
+                for (placed_boxes[0..placed_count]) |other| {
+                    if (box.x < other.x + other.w and box.x + box.w > other.x and
+                        box.y < other.y + other.h and box.y + box.h > other.y)
+                    {
+                        overlaps = true;
+                        break;
                     }
                 }
+                if (overlaps) continue;
+
+                placed_boxes[placed_count] = box;
+                placed_count += 1;
+
+                const baseline_y = ly + style.ascent();
+                // Crisp white halo behind dark label text:
+                _ = p.text(font_size, lx - 1, baseline_y, lbl.name, label_halo_color);
+                _ = p.text(font_size, lx + 1, baseline_y, lbl.name, label_halo_color);
+                _ = p.text(font_size, lx, baseline_y - 1, lbl.name, label_halo_color);
+                _ = p.text(font_size, lx, baseline_y + 1, lbl.name, label_halo_color);
+                _ = p.text(font_size, lx, baseline_y, lbl.name, label_color);
             }
         }
+    }
 
-        // 2. Coastlines & Continent Outlines:
-        if (self.state.show_borders) {
-            const border_color = gfx.Color.argb(0xb0a8d4a0);
-            for (map_data.landmasses) |lm| {
-                var pts: [64]gfx.Point = undefined;
-                var count: usize = 0;
-
-                for (lm.points) |p| {
-                    const p3 = globe.latLonToCartesian(p[1], p[0], 1.002);
-                    if (globe.project(p3, mvp, cam_model, w, h)) |scr| {
-                        if (count < pts.len) {
-                            pts[count] = .{ scr[0], scr[1] };
-                            count += 1;
-                        }
-                    } else {
-                        if (count >= 2) {
-                            c.strokePolyline(pts[0..count], false, 1.5, border_color);
-                        }
-                        count = 0;
-                    }
-                }
-                if (count >= 2) {
-                    c.strokePolyline(pts[0..count], false, 1.5, border_color);
-                }
-            }
-        }
-
-        // 3. Capitals and Cities:
-        if (self.state.show_cities) {
-            for (map_data.cities) |city| {
-                const p3 = globe.latLonToCartesian(city.lat, city.lon, 1.003);
+    fn drawProjectedSpans(
+        c: *gfx.Canvas,
+        points: []const [2]i16,
+        spans: []const map_data.LineSpan,
+        mvp: globe.Mat4,
+        cam_model: [3]f32,
+        w: f32,
+        h: f32,
+        thickness: f32,
+        color: gfx.Color,
+    ) void {
+        var pts: [128]gfx.Point = undefined;
+        for (spans) |sp| {
+            var count: usize = 0;
+            const end = @min(@as(usize, sp.start) + @as(usize, sp.len), points.len);
+            for (points[sp.start..end]) |pt| {
+                const lon = @as(f32, @floatFromInt(pt[0])) * 0.01;
+                const lat = @as(f32, @floatFromInt(pt[1])) * 0.01;
+                const p3 = globe.latLonToCartesian(lat, lon, 1.004);
                 if (globe.project(p3, mvp, cam_model, w, h)) |scr| {
-                    const is_sel = if (self.state.selected_city) |sc| std.mem.eql(u8, sc.name, city.name) else false;
-
-                    if (is_sel) {
-                        // Highlight ring
-                        c.fillCircle(.{ scr[0], scr[1] }, 9.0, gfx.Color.argb(0x40e8a838));
-                        c.strokeCircle(.{ scr[0], scr[1] }, 8.0, 1.5, gold_color);
-                        c.fillCircle(.{ scr[0], scr[1] }, 4.5, gold_color);
-                    } else if (city.is_capital) {
-                        c.fillCircle(.{ scr[0], scr[1] }, 4.0, gfx.Color.argb(0xffffffff));
-                        c.strokeCircle(.{ scr[0], scr[1] }, 4.0, 1.0, gfx.Color.argb(0xdd102030));
-                    } else {
-                        c.fillCircle(.{ scr[0], scr[1] }, 3.0, gfx.Color.argb(0xdd8ec4f4));
+                    if (count == pts.len) {
+                        c.strokePolyline(pts[0..count], false, thickness, color);
+                        pts[0] = pts[count - 1];
+                        count = 1;
                     }
+                    pts[count] = .{ scr[0], scr[1] };
+                    count += 1;
+                } else {
+                    if (count >= 2) {
+                        c.strokePolyline(pts[0..count], false, thickness, color);
+                    }
+                    count = 0;
                 }
+            }
+            if (count >= 2) {
+                c.strokePolyline(pts[0..count], false, thickness, color);
             }
         }
     }
 
     pub fn event(self: *const GlobeView, n: *ui.Node, e: ui.Event) bool {
-        const w = n.size.w;
-        const h = n.size.h;
-
         switch (e) {
             .press => |pr| {
-                if (pr.button == 0x110) { // Primary left click
+                if (pr.button == ui.btn_left) {
                     self.state.is_dragging = true;
                     self.state.last_pointer = pr.pos;
                     self.state.drag_vel_x = 0;
                     self.state.drag_vel_y = 0;
-                    self.state.target_yaw = null;
-                    self.state.target_pitch = null;
-
-                    // Raycast to check if a city was clicked:
-                    const hit = globe.raycastSphere(
-                        pr.pos[0],
-                        pr.pos[1],
-                        w,
-                        h,
-                        45.0 * (std.math.pi / 180.0),
-                        self.state.distance,
-                        self.state.yaw,
-                        self.state.pitch,
-                    );
-
-                    if (hit) |coord| {
-                        // Check if close to any city:
-                        var closest_city: ?map_data.City = null;
-                        var closest_dist: f32 = 8.0; // Max degree radius
-                        for (map_data.cities) |city| {
-                            const d_lat = city.lat - coord.lat;
-                            const d_lon = (city.lon - coord.lon) * @cos(coord.lat * (std.math.pi / 180.0));
-                            const dist = @sqrt(d_lat * d_lat + d_lon * d_lon);
-                            if (dist < closest_dist) {
-                                closest_dist = dist;
-                                closest_city = city;
-                            }
-                        }
-                        if (closest_city) |c| {
-                            self.state.selected_city = c;
-                        }
-                    }
+                    n.ui.needs_frame = true;
                     return true;
                 }
             },
@@ -828,33 +395,36 @@ pub const GlobeView = struct {
                         const dx = pos[0] - last[0];
                         const dy = pos[1] - last[1];
 
-                        // Sensitivity scaled by distance (zoomed in -> finer rotation):
                         const sens = (self.state.distance / 2.5) * 0.005;
-                        const d_yaw = dx * sens;
-                        const d_pitch = dy * sens;
+                        self.state.yaw += dx * sens;
+                        self.state.pitch = std.math.clamp(self.state.pitch + dy * sens, -1.45, 1.45);
 
-                        self.state.yaw += d_yaw;
-                        self.state.pitch = std.math.clamp(self.state.pitch + d_pitch, -1.45, 1.45);
-
-                        // Velocity for momentum:
-                        self.state.drag_vel_x = dx * sens * 30.0;
-                        self.state.drag_vel_y = dy * sens * 30.0;
+                        self.state.drag_vel_x = dx * sens * 25.0;
+                        self.state.drag_vel_y = dy * sens * 25.0;
                     }
                     self.state.last_pointer = pos;
+                    n.ui.needs_frame = true;
                     return true;
                 }
             },
             .release => {
-                self.state.is_dragging = false;
-                self.state.last_pointer = null;
-                return true;
+                if (self.state.is_dragging) {
+                    self.state.is_dragging = false;
+                    self.state.last_pointer = null;
+                    n.ui.needs_frame = true;
+                    return true;
+                }
             },
             .scroll => |sc| {
+                // Ignore touch-pan scroll queries so touch dragging uses .press/.motion/.release
+                // instead of cancelling the press!
+                if (sc.touch) return false;
                 if (sc.dy < 0) {
                     self.state.zoomIn();
                 } else if (sc.dy > 0) {
                     self.state.zoomOut();
                 }
+                n.ui.needs_frame = true;
                 return true;
             },
             else => {},
@@ -871,9 +441,6 @@ test "Maps view fits from smallest window to biggest without overflowing" {
     const u = try ui.Ui.create(testing.allocator, &f);
     defer u.destroy();
 
-    var tm = tiles.TileManager.init(testing.allocator);
-    defer tm.deinit();
-
     for ([_][2]u32{
         min_size,
         open_size,
@@ -882,8 +449,6 @@ test "Maps view fits from smallest window to biggest without overflowing" {
     }) |size| {
         u.frame(size[0], size[1], 0, Maps{
             .globe_gpu = null,
-            .tile_manager = &tm,
-            .width = @floatFromInt(size[0]),
         });
         const Check = struct {
             fn none(n: *ui.Node) !void {
@@ -895,29 +460,70 @@ test "Maps view fits from smallest window to biggest without overflowing" {
     }
 }
 
-test "zoom in and zoom out state transitions" {
+test "dragging the globe with the mouse moves it immediately while dragging" {
+    const font_data = @import("font");
+    const f = try font_data.Font.init(@embedFile("FiraSans-Regular.ttf"));
+    const u = try ui.Ui.create(testing.allocator, &f);
+    defer u.destroy();
+
     var state = Maps.State{};
-    const init_dist = state.distance;
-    state.zoomIn();
-    try testing.expect(state.distance < init_dist);
-    state.zoomOut();
-    try testing.expect(state.distance > 1.25);
+    const init_yaw = state.yaw;
+    const init_pitch = state.pitch;
+
+    const Root = struct {
+        s: *Maps.State,
+        pub fn build(self: *const @This(), cx: *ui.Context) ui.Widget {
+            return (Maps{}).build(cx, self.s);
+        }
+    };
+
+    u.frame(800, 600, 0, Root{ .s = &state });
+
+    // Press mouse button in the center of the globe:
+    u.pointerButton(.{ 400, 300 }, ui.btn_left, true);
+    try testing.expect(state.is_dragging);
+
+    // Move mouse while holding button down (before releasing):
+    u.needs_frame = false;
+    u.pointerMotion(.{ 480, 340 });
+
+    // Globe yaw and pitch must have updated immediately during drag, and UI must request a frame:
+    try testing.expect(state.yaw != init_yaw);
+    try testing.expect(state.pitch != init_pitch);
+    try testing.expect(u.needs_frame);
+
+    // Release mouse button:
+    u.pointerButton(.{ 480, 340 }, ui.btn_left, false);
+    try testing.expect(!state.is_dragging);
 }
 
-test "flying to a city" {
-    var state = Maps.State{};
-    state.flyToCity(map_data.cities[0]); // London
-    try testing.expect(state.selected_city != null);
-    try testing.expectEqualStrings("London", state.selected_city.?.name);
-    try testing.expect(state.target_yaw != null);
-    try testing.expect(state.target_pitch != null);
-}
+test "dragging the globe with touch moves it immediately without cancelling press" {
+    const font_data = @import("font");
+    const f = try font_data.Font.init(@embedFile("FiraSans-Regular.ttf"));
+    const u = try ui.Ui.create(testing.allocator, &f);
+    defer u.destroy();
 
-test "layer toggles" {
     var state = Maps.State{};
-    try testing.expect(state.day_night_lighting);
-    state.toggleDayNight(false);
-    try testing.expect(!state.day_night_lighting);
-    state.toggleGraticule(false);
-    try testing.expect(!state.show_graticule);
+    const init_yaw = state.yaw;
+
+    const Root = struct {
+        s: *Maps.State,
+        pub fn build(self: *const @This(), cx: *ui.Context) ui.Widget {
+            return (Maps{}).build(cx, self.s);
+        }
+    };
+
+    u.frame(800, 600, 0, Root{ .s = &state });
+
+    u.touchDown(1, .{ 400, 300 });
+    try testing.expect(state.is_dragging);
+
+    u.needs_frame = false;
+    u.touchMotion(1, .{ 460, 320 });
+    try testing.expect(state.is_dragging);
+    try testing.expect(state.yaw != init_yaw);
+    try testing.expect(u.needs_frame);
+
+    u.touchUp(1);
+    try testing.expect(!state.is_dragging);
 }

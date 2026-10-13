@@ -4,7 +4,7 @@
 const std = @import("std");
 const vc4 = @import("vc4");
 const shader = @import("shader");
-const map_data = @import("map_data.zig");
+const map_data = @import("map_data");
 
 pub const Mat4 = [16]f32;
 
@@ -190,7 +190,7 @@ pub fn raycastSphere(screen_x: f32, screen_y: f32, vp_w: f32, vp_h: f32, fovy_ra
 
 pub const Vertex = extern struct {
     pos: [3]f32,
-    uv: [2]f32,
+    color: [3]f32,
     normal: [3]f32,
 };
 
@@ -204,7 +204,15 @@ pub const Mesh = struct {
     }
 };
 
-/// Generates a smooth UV sphere with `lat_segs` rings and `lon_segs` slices.
+fn argbToRgb(argb: u32) [3]f32 {
+    const r = @as(f32, @floatFromInt((argb >> 16) & 0xff)) / 255.0;
+    const g = @as(f32, @floatFromInt((argb >> 8) & 0xff)) / 255.0;
+    const b = @as(f32, @floatFromInt(argb & 0xff)) / 255.0;
+    return .{ r, g, b };
+}
+
+/// Generates a smooth UV sphere with `lat_segs` rings and `lon_segs` slices,
+/// colored with the MapLibre ocean fill (`#D8F2FF`).
 pub fn generateSphere(gpa: std.mem.Allocator, lat_segs: u32, lon_segs: u32) !Mesh {
     const nv = (lat_segs + 1) * (lon_segs + 1);
     const ni = lat_segs * lon_segs * 6;
@@ -212,6 +220,8 @@ pub fn generateSphere(gpa: std.mem.Allocator, lat_segs: u32, lon_segs: u32) !Mes
     errdefer gpa.free(vertices);
     const indices = try gpa.alloc(u16, ni);
     errdefer gpa.free(indices);
+
+    const ocean_rgb = argbToRgb(map_data.ocean_color);
 
     var vi: u32 = 0;
     for (0..lat_segs + 1) |y| {
@@ -234,7 +244,7 @@ pub fn generateSphere(gpa: std.mem.Allocator, lat_segs: u32, lon_segs: u32) !Mes
 
             vertices[vi] = .{
                 .pos = .{ px, py, pz },
-                .uv = .{ u, v },
+                .color = ocean_rgb,
                 .normal = .{ px, py, pz },
             };
             vi += 1;
@@ -260,15 +270,83 @@ pub fn generateSphere(gpa: std.mem.Allocator, lat_segs: u32, lon_segs: u32) !Mes
     return .{ .vertices = vertices, .indices = indices };
 }
 
-pub const texture_w = 512;
-pub const texture_h = 256;
+/// Generates the complete 3D vector globe mesh combining the ocean sphere
+/// and all Natural Earth 110m country vector triangles.
+pub fn generateVectorGlobeMesh(gpa: std.mem.Allocator) !Mesh {
+    const sphere = try generateSphere(gpa, 40, 80);
+    defer sphere.deinit(gpa);
 
-/// GPU rendering resources for the 3D Globe on Raspberry Pi VideoCore IV.
+    const country_v_count = map_data.country_vertices.len;
+    const country_i_count = map_data.country_indices.len;
+
+    const total_v = sphere.vertices.len + country_v_count;
+    const total_i = sphere.indices.len + country_i_count;
+
+    const vertices = try gpa.alloc(Vertex, total_v);
+    errdefer gpa.free(vertices);
+    const indices = try gpa.alloc(u16, total_i);
+    errdefer gpa.free(indices);
+
+    // 1. Copy ocean sphere vertices and indices:
+    @memcpy(vertices[0..sphere.vertices.len], sphere.vertices);
+    @memcpy(indices[0..sphere.indices.len], sphere.indices);
+
+    // 2. Append Natural Earth country vertices slightly above unit sphere (r = 1.003):
+    const v_base: u16 = @intCast(sphere.vertices.len);
+    for (map_data.country_vertices, 0..) |cv, i| {
+        const lat_deg = @as(f32, @floatFromInt(cv.lat_cd)) * 0.01;
+        const lon_deg = @as(f32, @floatFromInt(cv.lon_cd)) * 0.01;
+        const n = latLonToCartesian(lat_deg, lon_deg, 1.0);
+        const pos = [3]f32{ n[0] * 1.003, n[1] * 1.003, n[2] * 1.003 };
+        const palette_idx = @min(cv.color_idx, @as(u8, @intCast(map_data.country_palette.len - 1)));
+        const rgb = argbToRgb(map_data.country_palette[palette_idx]);
+
+        vertices[sphere.vertices.len + i] = .{
+            .pos = pos,
+            .color = rgb,
+            .normal = n,
+        };
+    }
+
+    // 3. Append country triangle indices with consistent outward CCW winding:
+    var out_ii: usize = sphere.indices.len;
+    var src_ii: usize = 0;
+    while (src_ii + 2 < country_i_count) : (src_ii += 3) {
+        const idx0 = v_base + map_data.country_indices[src_ii];
+        const idx1 = v_base + map_data.country_indices[src_ii + 1];
+        const idx2 = v_base + map_data.country_indices[src_ii + 2];
+
+        const p0 = vertices[idx0].pos;
+        const p1 = vertices[idx1].pos;
+        const p2 = vertices[idx2].pos;
+
+        const e1 = [3]f32{ p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2] };
+        const e2 = [3]f32{ p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2] };
+        const cx = e1[1] * e2[2] - e1[2] * e2[1];
+        const cy = e1[2] * e2[0] - e1[0] * e2[2];
+        const cz = e1[0] * e2[1] - e1[1] * e2[0];
+        const dot = cx * p0[0] + cy * p0[1] + cz * p0[2];
+
+        if (dot >= 0) {
+            indices[out_ii] = idx0;
+            indices[out_ii + 1] = idx1;
+            indices[out_ii + 2] = idx2;
+        } else {
+            indices[out_ii] = idx0;
+            indices[out_ii + 1] = idx2;
+            indices[out_ii + 2] = idx1;
+        }
+        out_ii += 3;
+    }
+
+    return .{ .vertices = vertices, .indices = indices };
+}
+
+/// GPU rendering resources for the 3D Vector Globe on Raspberry Pi VideoCore IV.
 pub const GlobeGpu = struct {
     pipeline: shader.Pipeline,
     vbo: vc4.Bo,
     ibo: vc4.Bo,
-    texture: vc4.Bo,
     vertex_count: u32,
     index_count: u32,
 
@@ -278,15 +356,14 @@ pub const GlobeGpu = struct {
             .vertex_stride = @sizeOf(Vertex),
             .attributes = &.{
                 .{ .location = 0, .offset = @offsetOf(Vertex, "pos") },
-                .{ .location = 1, .offset = @offsetOf(Vertex, "uv") },
+                .{ .location = 1, .offset = @offsetOf(Vertex, "color") },
                 .{ .location = 2, .offset = @offsetOf(Vertex, "normal") },
             },
             .cull = .back,
         });
         errdefer pipeline.deinit(dev);
 
-        // Generate 3D sphere mesh: 40 rings x 80 slices = 3,200 quads
-        const mesh = try generateSphere(gpa, 40, 80);
+        const mesh = try generateVectorGlobeMesh(gpa);
         defer mesh.deinit(gpa);
 
         const vbo = try dev.createBo(@intCast(mesh.vertices.len * @sizeOf(Vertex)));
@@ -297,20 +374,10 @@ pub const GlobeGpu = struct {
         @memcpy(vbo.map[0 .. mesh.vertices.len * @sizeOf(Vertex)], std.mem.sliceAsBytes(mesh.vertices));
         @memcpy(ibo.map[0 .. mesh.indices.len * 2], std.mem.sliceAsBytes(mesh.indices));
 
-        // Generate offline base map texture:
-        const pixels = try gpa.alloc(u32, texture_w * texture_h);
-        defer gpa.free(pixels);
-        map_data.renderBaseMap(pixels, texture_w, texture_h);
-
-        const texture = try dev.createBo(vc4.texture.imageSize(texture_w, texture_h));
-        errdefer dev.destroyBo(texture);
-        vc4.texture.upload(texture.map, pixels, texture_w, texture_h);
-
         return .{
             .pipeline = pipeline,
             .vbo = vbo,
             .ibo = ibo,
-            .texture = texture,
             .vertex_count = @intCast(mesh.vertices.len),
             .index_count = @intCast(mesh.indices.len),
         };
@@ -320,7 +387,6 @@ pub const GlobeGpu = struct {
         g.pipeline.deinit(dev);
         dev.destroyBo(g.vbo);
         dev.destroyBo(g.ibo);
-        dev.destroyBo(g.texture);
     }
 
     pub fn draw(
@@ -331,17 +397,14 @@ pub const GlobeGpu = struct {
         mvp_mat: Mat4,
         rot_mat: Mat4,
         sun_dir: [3]f32,
-        day_night_on: bool,
         cam_pos: [3]f32,
-        atmo_on: bool,
     ) !void {
         // Uniforms layout matches globe.zig shader:
         // mvp: [4]Vec4 (16 floats)
         // rotation: [3]Vec4 (12 floats)
         // sun: Vec4 (4 floats)
         // camera: Vec4 (4 floats)
-        // options: Vec4 (4 floats)
-        var uniforms: [40]f32 = undefined;
+        var uniforms: [36]f32 = undefined;
         uniforms[0..16].* = mvp_mat;
 
         // Rotation columns (columns 0, 1, 2, with w=0):
@@ -349,14 +412,11 @@ pub const GlobeGpu = struct {
         uniforms[20..24].* = .{ rot_mat[4], rot_mat[5], rot_mat[6], 0 };
         uniforms[24..28].* = .{ rot_mat[8], rot_mat[9], rot_mat[10], 0 };
 
-        // Sun vector & toggle:
-        uniforms[28..32].* = .{ sun_dir[0], sun_dir[1], sun_dir[2], if (day_night_on) 1.0 else 0.0 };
+        // Sun vector:
+        uniforms[28..32].* = .{ sun_dir[0], sun_dir[1], sun_dir[2], 0.0 };
 
-        // Camera position & atmosphere toggle:
-        uniforms[32..36].* = .{ cam_pos[0], cam_pos[1], cam_pos[2], if (atmo_on) 1.0 else 0.0 };
-
-        // Options: texturing=1, spare=0
-        uniforms[36..40].* = .{ 1.0, 0.0, 0.0, 0.0 };
+        // Camera position in model space:
+        uniforms[32..36].* = .{ cam_pos[0], cam_pos[1], cam_pos[2], 0.0 };
 
         g.pipeline.setUniforms(std.mem.asBytes(&uniforms));
         try g.pipeline.draw(frame, .{
@@ -366,7 +426,6 @@ pub const GlobeGpu = struct {
             .vertex_offset = 0,
             .count = g.index_count,
             .indices = .{ .handle = g.ibo.handle, .offset = 0, .max_index = g.vertex_count - 1 },
-            .texture = .{ .handle = g.texture.handle, .config = .{ .width = texture_w, .height = texture_h } },
         });
     }
 };
@@ -396,18 +455,16 @@ test "raycasting off the sphere" {
     try testing.expect(hit == null);
 }
 
-test "sphere mesh generation and globe shader validation" {
-    const mesh = try generateSphere(testing.allocator, 40, 80);
+test "vector globe mesh generation and globe shader validation" {
+    const mesh = try generateVectorGlobeMesh(testing.allocator);
     defer mesh.deinit(testing.allocator);
-    try testing.expectEqual(@as(usize, 41 * 81), mesh.vertices.len);
-    try testing.expectEqual(@as(usize, 40 * 80 * 6), mesh.indices.len);
+    try testing.expectEqual(@as(usize, 41 * 81 + map_data.country_vertices.len), mesh.vertices.len);
+    try testing.expectEqual(@as(usize, 40 * 80 * 6 + map_data.country_indices.len), mesh.indices.len);
     for (mesh.indices) |idx| try testing.expect(idx < mesh.vertices.len);
 
     // Equator at Prime Meridian (u = 0.5, v = 0.5 -> y = 20, x = 40) must be at +Z (0, 0, 1),
-    // matching latLonToCartesian(0.0, 0.0, 1.0) and renderBaseMap's lon = u * 360 - 180 = 0.
+    // matching latLonToCartesian(0.0, 0.0, 1.0).
     const prime_eq = mesh.vertices[20 * 81 + 40];
-    try testing.expectApproxEqAbs(@as(f32, 0.5), prime_eq.uv[0], 1e-5);
-    try testing.expectApproxEqAbs(@as(f32, 0.5), prime_eq.uv[1], 1e-5);
     const expected = latLonToCartesian(0.0, 0.0, 1.0);
     try testing.expectApproxEqAbs(expected[0], prime_eq.pos[0], 1e-5);
     try testing.expectApproxEqAbs(expected[1], prime_eq.pos[1], 1e-5);

@@ -1,6 +1,5 @@
-//! Maps: an interactive 3D globe application for Dazzle, showing
-//! the Earth with day/night illumination, atmospheric limb glow,
-//! offline coastlines, countries, world capitals, and remote tile access.
+//! Maps: an interactive 3D political globe application for Dazzle, showing
+//! the Earth rendered with embedded Natural Earth vectors.
 //!
 //!     dazzle-maps [font.ttf]
 //!
@@ -14,14 +13,13 @@ const font = @import("font");
 const ui = @import("ui");
 const build_info = @import("build_info");
 
-const map_data = @import("map_data.zig");
+const map_data = @import("map_data");
 const globe = @import("globe.zig");
-const tiles = @import("tiles.zig");
 const view = @import("view.zig");
 
 const print = sys.print;
 
-const background = 0xff080e18;
+const background = 0xff0b101b;
 
 pub fn main(init: std.process.Init.Minimal) u8 {
     sys.logToKmsgIfStderr();
@@ -54,17 +52,12 @@ fn run(init: std.process.Init.Minimal, font_path: [*:0]const u8) !void {
     var globe_gpu = try globe.GlobeGpu.init(gpa, a.dev);
     defer globe_gpu.deinit(a.dev);
 
-    var tile_manager = tiles.TileManager.init(gpa);
-    defer tile_manager.deinit();
-
     while (try a.step(100 * std.time.ns_per_ms)) {
         const frame_start = sys.nowNs();
         a.takeInput();
 
         try a.draw(frame_start, view.Maps{
             .globe_gpu = &globe_gpu,
-            .tile_manager = &tile_manager,
-            .width = @floatFromInt(a.width),
         });
     }
 }
@@ -72,6 +65,5 @@ fn run(init: std.process.Init.Minimal, font_path: [*:0]const u8) !void {
 test {
     _ = map_data;
     _ = globe;
-    _ = tiles;
     _ = view;
 }
