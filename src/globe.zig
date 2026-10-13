@@ -127,47 +127,50 @@ pub fn project(point: [3]f32, mvp: Mat4, cam_pos: [3]f32, vp_w: f32, vp_h: f32) 
     return .{ sx, sy };
 }
 
-/// Raycasts from screen coordinates (x, y) onto the 3D unit sphere.
-/// Returns the geographic coordinates of the hit point, or null if the ray misses the sphere.
-pub fn raycastSphere(screen_x: f32, screen_y: f32, vp_w: f32, vp_h: f32, fovy_rad: f32, distance: f32, yaw: f32, pitch: f32) ?map_data.Coord {
-    if (vp_w <= 0 or vp_h <= 0) return null;
+/// Raycasts from screen coordinates (x, y) onto the 3D unit sphere in camera space.
+/// When `clamp_to_horizon` is true, rays outside the sphere disk are clamped to the
+/// closest point on the sphere's visible horizon rim.
+pub fn raycastCameraSphere(
+    screen_x: f32,
+    screen_y: f32,
+    vp_w: f32,
+    vp_h: f32,
+    fovy_rad: f32,
+    distance: f32,
+    clamp_to_horizon: bool,
+) ?[3]f32 {
+    if (vp_w <= 0 or vp_h <= 0 or distance <= 1.0) return null;
     const aspect = vp_w / vp_h;
     const tan_fov = @tan(fovy_rad * 0.5);
 
-    // NDC coordinates (-1 to 1):
     const ndc_x = (2.0 * screen_x / vp_w) - 1.0;
     const ndc_y = 1.0 - (2.0 * screen_y / vp_h);
 
-    // Camera space ray direction:
-    const dx_cam = ndc_x * tan_fov * aspect;
-    const dy_cam = ndc_y * tan_fov;
-    const dz_cam = -1.0;
-    const len = @sqrt(dx_cam * dx_cam + dy_cam * dy_cam + dz_cam * dz_cam);
-    const d_cam = [3]f32{ dx_cam / len, dy_cam / len, dz_cam / len };
+    var rx = ndc_x * tan_fov * aspect;
+    var ry = ndc_y * tan_fov;
+    var r2 = rx * rx + ry * ry;
+    const max_r2 = 1.0 / (distance * distance - 1.0);
 
-    // Camera origin in world space:
-    const cam_world = [3]f32{ 0, 0, distance };
+    if (r2 > max_r2) {
+        if (!clamp_to_horizon) return null;
+        const scale = @sqrt(max_r2 / r2);
+        rx *= scale;
+        ry *= scale;
+        r2 = max_r2;
+    }
 
-    // Ray-sphere intersection in camera space:
-    // Sphere is at origin with radius 1.0.
-    const b = cam_world[2] * d_cam[2]; // cam_world is [0, 0, d], so C · D = d * d_cam[2]
-    const c = distance * distance - 1.0; // |C|^2 - R^2
-    const disc = b * b - c;
-    if (disc < 0) return null; // Missed sphere
-
-    const t = -b - @sqrt(disc);
-    if (t < 0) return null;
-
-    // Hit point in camera space:
-    const hit_cam = [3]f32{
-        cam_world[0] + t * d_cam[0],
-        cam_world[1] + t * d_cam[1],
-        cam_world[2] + t * d_cam[2],
+    const disc = @max(0.0, 1.0 - r2 * (distance * distance - 1.0));
+    const t = (distance - @sqrt(disc)) / (r2 + 1.0);
+    return .{
+        t * rx,
+        t * ry,
+        distance - t,
     };
+}
 
-    // Transform hit point back by inverse camera rotation (un-pitch, then un-yaw):
-    // Pitch rotation was around X, yaw rotation was around Y.
-    // Inverse pitch: rotate by -pitch around X.
+/// Transforms a camera-space point on the sphere into model space by undoing
+/// the camera's pitch (X) and yaw (Y) rotations.
+pub fn cameraToModel(hit_cam: [3]f32, yaw: f32, pitch: f32) [3]f32 {
     const cos_p = @cos(-pitch);
     const sin_p = @sin(-pitch);
     const hit_pitch = [3]f32{
@@ -176,16 +179,63 @@ pub fn raycastSphere(screen_x: f32, screen_y: f32, vp_w: f32, vp_h: f32, fovy_ra
         hit_cam[1] * sin_p + hit_cam[2] * cos_p,
     };
 
-    // Inverse yaw: rotate by -yaw around Y.
     const cos_y = @cos(-yaw);
     const sin_y = @sin(-yaw);
-    const hit_model = [3]f32{
+    return .{
         hit_pitch[0] * cos_y + hit_pitch[2] * sin_y,
         hit_pitch[1],
         -hit_pitch[0] * sin_y + hit_pitch[2] * cos_y,
     };
+}
 
+/// Raycasts from screen coordinates (x, y) onto the 3D unit sphere.
+/// Returns the geographic coordinates of the hit point, or null if the ray misses the sphere.
+pub fn raycastSphere(screen_x: f32, screen_y: f32, vp_w: f32, vp_h: f32, fovy_rad: f32, distance: f32, yaw: f32, pitch: f32) ?map_data.Coord {
+    const hit_cam = raycastCameraSphere(screen_x, screen_y, vp_w, vp_h, fovy_rad, distance, false) orelse return null;
+    const hit_model = cameraToModel(hit_cam, yaw, pitch);
     return cartesianToLatLon(hit_model);
+}
+
+fn wrapAngle(a: f32) f32 {
+    return @rem(a + std.math.pi, 2.0 * std.math.pi) - (if (a + std.math.pi >= 0) @as(f32, std.math.pi) else -std.math.pi);
+}
+
+/// Solves for the globe `yaw` and `pitch` that place the model-space unit vector
+/// `anchor` at the camera-space unit vector `target_cam` under the cursor.
+pub fn solveDragRotation(
+    anchor: [3]f32,
+    target_cam: [3]f32,
+    cur_yaw: f32,
+    cur_pitch: f32,
+    max_pitch: f32,
+) struct { yaw: f32, pitch: f32 } {
+    const hx = target_cam[0];
+    const hy = target_cam[1];
+    const hz = target_cam[2];
+    const r_yz = @sqrt(hy * hy + hz * hz);
+
+    var pitch = cur_pitch;
+    if (r_yz > 1e-5) {
+        const alpha = std.math.atan2(hy, hz);
+        const sin_val = std.math.clamp(anchor[1] / r_yz, -1.0, 1.0);
+        const theta = std.math.asin(sin_val);
+        const p1 = wrapAngle(theta - alpha);
+        const p2 = wrapAngle((std.math.pi - theta) - alpha);
+        const d1 = @abs(wrapAngle(p1 - cur_pitch));
+        const d2 = @abs(wrapAngle(p2 - cur_pitch));
+        const chosen = if (d1 <= d2) p1 else p2;
+        pitch = std.math.clamp(chosen, -max_pitch, max_pitch);
+    }
+
+    const z1 = -hy * @sin(pitch) + hz * @cos(pitch);
+    const horiz = @sqrt(anchor[0] * anchor[0] + anchor[2] * anchor[2]);
+    var yaw = cur_yaw;
+    if (horiz > 1e-5 and (hx * hx + z1 * z1) > 1e-8) {
+        const lon = std.math.atan2(anchor[0], anchor[2]);
+        const target_lon = std.math.atan2(hx, z1);
+        yaw = cur_yaw + wrapAngle((target_lon - lon) - cur_yaw);
+    }
+    return .{ .yaw = yaw, .pitch = pitch };
 }
 
 pub const Vertex = extern struct {
@@ -453,6 +503,32 @@ test "raycasting off the sphere" {
     // Click in outer corner of viewport should miss the sphere
     const hit = raycastSphere(10.0, 10.0, 640.0, 480.0, 45.0 * (std.math.pi / 180.0), 2.5, 0.0, 0.0);
     try testing.expect(hit == null);
+}
+
+test "solveDragRotation keeps the clicked point under the cursor" {
+    const vp_w: f32 = 800.0;
+    const vp_h: f32 = 600.0;
+    const fovy: f32 = 45.0 * (std.math.pi / 180.0);
+    const dist: f32 = 2.5;
+    const init_yaw: f32 = 0.2;
+    const init_pitch: f32 = 0.25;
+
+    // Click at (350, 260) on the globe:
+    const hit0 = raycastCameraSphere(350.0, 260.0, vp_w, vp_h, fovy, dist, false).?;
+    const anchor = cameraToModel(hit0, init_yaw, init_pitch);
+
+    // Drag to (460, 330):
+    const hit1 = raycastCameraSphere(460.0, 330.0, vp_w, vp_h, fovy, dist, true).?;
+    const rot = solveDragRotation(anchor, hit1, init_yaw, init_pitch, 1.45);
+
+    // Verify that `anchor` now projects to (460, 330) on screen:
+    const proj = perspective(fovy, vp_w / vp_h, 0.1, 20.0);
+    const view = mul(translation(0, 0, -dist), mul(rotationX(rot.pitch), rotationY(rot.yaw)));
+    const mvp = mul(proj, view);
+    const cam_model = cameraToModel(.{ 0, 0, dist }, rot.yaw, rot.pitch);
+    const scr = project(anchor, mvp, cam_model, vp_w, vp_h).?;
+    try testing.expectApproxEqAbs(@as(f32, 460.0), scr[0], 0.05);
+    try testing.expectApproxEqAbs(@as(f32, 330.0), scr[1], 0.05);
 }
 
 test "vector globe mesh generation and globe shader validation" {

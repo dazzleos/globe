@@ -35,6 +35,7 @@ pub const Maps = struct {
         drag_vel_x: f32 = 0,
         drag_vel_y: f32 = 0,
         is_dragging: bool = false,
+        drag_anchor: ?[3]f32 = null,
         last_pointer: ?[2]f32 = null,
         last_frame_ns: ?u64 = null,
 
@@ -381,6 +382,12 @@ pub const GlobeView = struct {
         switch (e) {
             .press => |pr| {
                 if (pr.button == ui.btn_left) {
+                    const fovy = 45.0 * (std.math.pi / 180.0);
+                    if (globe.raycastCameraSphere(pr.pos[0], pr.pos[1], n.size.w, n.size.h, fovy, self.state.distance, false)) |hit_cam| {
+                        self.state.drag_anchor = globe.cameraToModel(hit_cam, self.state.yaw, self.state.pitch);
+                    } else {
+                        self.state.drag_anchor = null;
+                    }
                     self.state.is_dragging = true;
                     self.state.last_pointer = pr.pos;
                     self.state.drag_vel_x = 0;
@@ -391,16 +398,20 @@ pub const GlobeView = struct {
             },
             .motion => |pos| {
                 if (self.state.is_dragging) {
-                    if (self.state.last_pointer) |last| {
+                    const fovy = 45.0 * (std.math.pi / 180.0);
+                    if (self.state.drag_anchor) |anchor| {
+                        if (globe.raycastCameraSphere(pos[0], pos[1], n.size.w, n.size.h, fovy, self.state.distance, true)) |target_cam| {
+                            const rot = globe.solveDragRotation(anchor, target_cam, self.state.yaw, self.state.pitch, 1.45);
+                            self.state.yaw = rot.yaw;
+                            self.state.pitch = rot.pitch;
+                        }
+                    } else if (self.state.last_pointer) |last| {
                         const dx = pos[0] - last[0];
                         const dy = pos[1] - last[1];
 
                         const sens = (self.state.distance / 2.5) * 0.005;
                         self.state.yaw += dx * sens;
                         self.state.pitch = std.math.clamp(self.state.pitch + dy * sens, -1.45, 1.45);
-
-                        self.state.drag_vel_x = dx * sens * 25.0;
-                        self.state.drag_vel_y = dy * sens * 25.0;
                     }
                     self.state.last_pointer = pos;
                     n.ui.needs_frame = true;
@@ -410,6 +421,7 @@ pub const GlobeView = struct {
             .release => {
                 if (self.state.is_dragging) {
                     self.state.is_dragging = false;
+                    self.state.drag_anchor = null;
                     self.state.last_pointer = null;
                     n.ui.needs_frame = true;
                     return true;
@@ -479,18 +491,35 @@ test "dragging the globe with the mouse moves it immediately while dragging" {
 
     u.frame(800, 600, 0, Root{ .s = &state });
 
+    const Find = struct {
+        fn globeNode(n: *ui.Node) ?*ui.Node {
+            if (n.widget.is(GlobeView)) return n;
+            for (n.children.items) |ch| if (globeNode(ch)) |found| return found;
+            return null;
+        }
+    };
+    const gn = Find.globeNode(u.root.?).?;
+    const gpos = gn.position();
+    const fovy: f32 = 45.0 * (std.math.pi / 180.0);
+    const clicked_coord = globe.raycastSphere(400 - gpos[0], 300 - gpos[1], gn.size.w, gn.size.h, fovy, state.distance, state.yaw, state.pitch).?;
+
     // Press mouse button in the center of the globe:
     u.pointerButton(.{ 400, 300 }, ui.btn_left, true);
     try testing.expect(state.is_dragging);
+    try testing.expect(state.drag_anchor != null);
 
     // Move mouse while holding button down (before releasing):
     u.needs_frame = false;
     u.pointerMotion(.{ 480, 340 });
 
-    // Globe yaw and pitch must have updated immediately during drag, and UI must request a frame:
+    // Globe yaw and pitch must have updated immediately during drag, and the clicked
+    // point on the globe must now be directly under the new cursor position (480, 340):
     try testing.expect(state.yaw != init_yaw);
     try testing.expect(state.pitch != init_pitch);
     try testing.expect(u.needs_frame);
+    const dragged_coord = globe.raycastSphere(480 - gpos[0], 340 - gpos[1], gn.size.w, gn.size.h, fovy, state.distance, state.yaw, state.pitch).?;
+    try testing.expectApproxEqAbs(clicked_coord.lat, dragged_coord.lat, 0.05);
+    try testing.expectApproxEqAbs(clicked_coord.lon, dragged_coord.lon, 0.05);
 
     // Release mouse button:
     u.pointerButton(.{ 480, 340 }, ui.btn_left, false);
