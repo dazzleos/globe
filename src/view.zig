@@ -736,4 +736,3 @@ test "zooming in transitions to the 50m resolution dataset and renders cleanly" 
     };
     try Check.none(u.root.?);
 }
-
