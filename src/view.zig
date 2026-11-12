@@ -3,10 +3,10 @@
 //! boundaries, coastlines, and labels, with a top-right fullscreen toggle.
 
 const std = @import("std");
-const app = @import("app");
-const ui = @import("ui");
-const gfx = @import("gfx");
-const font = @import("font");
+const kete = @import("kete");
+const kete_vc4 = @import("kete_vc4");
+const gfx = kete.gfx;
+const font = kete.font;
 const vc4 = @import("vc4");
 const map_data = @import("map_data");
 const globe = @import("globe.zig");
@@ -23,11 +23,8 @@ pub const detail_distance: f32 = 2.0;
 
 pub const Maps = struct {
     globe_gpu: ?*globe.GlobeGpu = null,
-    on_close: ?ui.Callback = null,
-    on_maximize: ?ui.Callback = null,
-    on_fullscreen: ?ui.Callback = null,
-    on_drag: ?ui.Callback = null,
-    maximized: bool = true,
+    /// Full screen or not (the window's own, if null).
+    on_fullscreen: ?kete.Callback = null,
     fullscreen: bool = false,
 
     pub const State = struct {
@@ -51,7 +48,7 @@ pub const Maps = struct {
         }
     };
 
-    pub fn build(self: *const Maps, cx: *ui.Context, state: *State) ui.Widget {
+    pub fn build(self: *const Maps, cx: *kete.BuildContext, state: *State) kete.Widget {
         const now = cx.now();
         const dt = if (state.last_frame_ns) |last|
             @as(f32, @floatFromInt(now -| last)) / @as(f32, @floatFromInt(std.time.ns_per_s))
@@ -70,12 +67,13 @@ pub const Maps = struct {
             }
         }
 
-        const is_fullscreen = self.fullscreen or cx.ui.fullscreen;
+        const window = cx.window();
+        const is_fullscreen = self.fullscreen or (if (window) |w| w.isFullscreen() else false);
         const on_fullscreen = self.on_fullscreen orelse
-            if (cx.ui.controls) |c| ui.Callback.of(c, app.Controls.toggleFullscreen) else null;
+            if (window) |w| kete.Callback.of(w, toggleFullscreen) else null;
 
-        const a = cx.ui.arena();
-        var layers: std.ArrayList(ui.Widget) = .empty;
+        const a = cx.arena;
+        var layers: std.ArrayList(kete.Widget) = .empty;
 
         // 1. 3D Political Vector Globe (fills background, clipped to bounds)
         layers.append(a, cx.make(GlobeView{
@@ -84,14 +82,14 @@ pub const Maps = struct {
         })) catch {};
 
         // 2. Top-Right Fullscreen Toggle Button
-        layers.append(a, cx.make(ui.Align{
+        layers.append(a, cx.make(kete.Align{
             .alignment = .top_right,
-            .child = cx.make(ui.Padding{
+            .child = cx.make(kete.Padding{
                 .padding = .{ .top = 12, .right = 12 },
-                .child = cx.make(ui.Decorated{
+                .child = cx.make(kete.RoundedBox{
                     .color = button_bg,
-                    .radius = gfx.Radii.all(20),
-                    .child = cx.make(ui.IconButton{
+                    .radius = kete.CornerRadii.all(20),
+                    .child = cx.make(kete.IconButton{
                         .icon = if (is_fullscreen) .fullscreen_exit else .fullscreen,
                         .on_press = on_fullscreen,
                     }),
@@ -100,36 +98,22 @@ pub const Maps = struct {
         })) catch {};
 
         // 3. Bottom-Left Coordinates & Altitude Overlay
-        layers.append(a, cx.make(ui.Align{
+        layers.append(a, cx.make(kete.Align{
             .alignment = .bottom_left,
-            .child = cx.make(ui.Padding{
+            .child = cx.make(kete.Padding{
                 .padding = .{ .left = 12, .bottom = 12 },
                 .child = bottomHud(cx, state),
             }),
         })) catch {};
 
-        const content = cx.make(ui.Overlay{ .children = layers.items });
-
-        if (is_fullscreen) {
-            return content;
-        }
-
-        return cx.make(ui.Column{
-            .cross_axis_alignment = .stretch,
-            .children = &.{
-                cx.make(ui.TitleBar{
-                    .title = "Maps",
-                    .on_close = self.on_close,
-                    .on_maximize = self.on_maximize,
-                    .on_drag = self.on_drag,
-                    .maximized = self.maximized,
-                }),
-                cx.make(ui.Expanded{ .child = content }),
-            },
-        });
+        return cx.make(kete.Overlay{ .children = layers.items });
     }
 
-    fn bottomHud(cx: *ui.Context, state: *const State) ui.Widget {
+    fn toggleFullscreen(w: *kete.App.Window) void {
+        w.setFullscreen(!w.isFullscreen());
+    }
+
+    fn bottomHud(cx: *kete.BuildContext, state: *const State) kete.Widget {
         const center_lat = state.pitch * (180.0 / std.math.pi);
         const center_lon = -state.yaw * (180.0 / std.math.pi);
         const alt_km = @as(u32, @intFromFloat(@max(state.distance - 1.0, 0.1) * 6371.0));
@@ -153,12 +137,12 @@ pub const Maps = struct {
             alt_km,
         });
 
-        return cx.make(ui.Decorated{
+        return cx.make(kete.RoundedBox{
             .color = button_bg,
-            .radius = gfx.Radii.all(10),
-            .child = cx.make(ui.Padding{
+            .radius = kete.CornerRadii.all(10),
+            .child = cx.make(kete.Padding{
                 .padding = .{ .left = 14, .right = 14, .top = 8, .bottom = 8 },
-                .child = cx.make(ui.Text{
+                .child = cx.make(kete.Text{
                     .text = info,
                     .style = .{ .size = 14, .color = hud_text_color },
                     .wrap = false,
@@ -175,12 +159,12 @@ pub const GlobeView = struct {
     maps: *const Maps,
     state: *Maps.State,
 
-    pub fn layout(self: *const GlobeView, _: *ui.Node, c: ui.Constraints) ui.Size {
+    pub fn layout(self: *const GlobeView, _: *kete.WidgetNode, c: kete.Constraints) kete.Size {
         _ = self;
         return c.biggest();
     }
 
-    pub fn paint(self: *const GlobeView, n: *ui.Node, p: *ui.Painter) void {
+    pub fn paint(self: *const GlobeView, n: *kete.WidgetNode, p: *kete.Painter) void {
         const w = n.size.w;
         const h = n.size.h;
         if (w <= 1 or h <= 1) return;
@@ -221,8 +205,8 @@ pub const GlobeView = struct {
         self.paintOverlays(w, h, fg_c, p);
     }
 
-    fn drawGlobe(self: *const GlobeView, frame: *vc4.render.Frame, area: ui.GpuArea) anyerror!void {
-        const vp = area.viewport;
+    fn drawGlobe(self: *const GlobeView, frame: *vc4.render.Frame, area: kete.gfx.GpuArea) anyerror!void {
+        const vp = kete_vc4.renderer.viewport(area.viewport);
         const aspect = @as(f32, @floatFromInt(vp.width)) / @as(f32, @floatFromInt(@max(vp.height, 1)));
         const proj = globe.perspective(45.0 * (std.math.pi / 180.0), aspect, 0.1, 20.0);
         const view_trans = globe.translation(0, 0, -self.state.distance);
@@ -249,8 +233,8 @@ pub const GlobeView = struct {
 
         try self.maps.globe_gpu.?.draw(
             frame,
-            area.viewport,
-            area.scissor,
+            vp,
+            if (area.scissor) |sc| kete_vc4.renderer.viewport(sc) else null,
             mvp,
             rot,
             sun_dir,
@@ -259,7 +243,7 @@ pub const GlobeView = struct {
         );
     }
 
-    fn paintOverlays(self: *const GlobeView, w: f32, h: f32, c: *gfx.Canvas, p: *ui.Painter) void {
+    fn paintOverlays(self: *const GlobeView, w: f32, h: f32, c: *gfx.Canvas, p: *kete.Painter) void {
         const aspect = w / h;
         const proj = globe.perspective(45.0 * (std.math.pi / 180.0), aspect, 0.1, 20.0);
         const view_trans = globe.translation(0, 0, -self.state.distance);
@@ -527,10 +511,10 @@ pub const GlobeView = struct {
         }
     }
 
-    pub fn event(self: *const GlobeView, n: *ui.Node, e: ui.Event) bool {
+    pub fn event(self: *const GlobeView, n: *kete.WidgetNode, e: kete.Event) bool {
         switch (e) {
             .press => |pr| {
-                if (pr.button == ui.btn_left) {
+                if (pr.button == .left) {
                     const fovy = 45.0 * (std.math.pi / 180.0);
                     if (globe.raycastCameraSphere(pr.pos[0], pr.pos[1], n.size.w, n.size.h, fovy, self.state.distance, false)) |hit_cam| {
                         self.state.drag_anchor = globe.cameraToModel(hit_cam, self.state.yaw, self.state.pitch);
@@ -597,9 +581,9 @@ pub const GlobeView = struct {
 const testing = std.testing;
 
 test "Maps view fits from smallest window to biggest without overflowing" {
-    const font_data = @import("font");
+    const font_data = kete.font;
     const f = try font_data.Font.init(@embedFile("FiraSans-Regular.ttf"));
-    const u = try ui.Ui.create(testing.allocator, &f);
+    const u = try kete.ui.WindowUi.create(testing.allocator, testing.io, &f);
     defer u.destroy();
 
     for ([_][2]u32{
@@ -612,7 +596,7 @@ test "Maps view fits from smallest window to biggest without overflowing" {
             .globe_gpu = null,
         });
         const Check = struct {
-            fn none(n: *ui.Node) !void {
+            fn none(n: *kete.WidgetNode) !void {
                 try testing.expect(!n.overflow.any());
                 for (n.children.items) |ch| try none(ch);
             }
@@ -622,9 +606,9 @@ test "Maps view fits from smallest window to biggest without overflowing" {
 }
 
 test "dragging the globe with the mouse moves it immediately while dragging" {
-    const font_data = @import("font");
+    const font_data = kete.font;
     const f = try font_data.Font.init(@embedFile("FiraSans-Regular.ttf"));
-    const u = try ui.Ui.create(testing.allocator, &f);
+    const u = try kete.ui.WindowUi.create(testing.allocator, testing.io, &f);
     defer u.destroy();
 
     var state = Maps.State{};
@@ -633,7 +617,7 @@ test "dragging the globe with the mouse moves it immediately while dragging" {
 
     const Root = struct {
         s: *Maps.State,
-        pub fn build(self: *const @This(), cx: *ui.Context) ui.Widget {
+        pub fn build(self: *const @This(), cx: *kete.BuildContext) kete.Widget {
             return (Maps{}).build(cx, self.s);
         }
     };
@@ -641,7 +625,7 @@ test "dragging the globe with the mouse moves it immediately while dragging" {
     u.frame(800, 600, 0, Root{ .s = &state });
 
     const Find = struct {
-        fn globeNode(n: *ui.Node) ?*ui.Node {
+        fn globeNode(n: *kete.WidgetNode) ?*kete.WidgetNode {
             if (n.widget.is(GlobeView)) return n;
             for (n.children.items) |ch| if (globeNode(ch)) |found| return found;
             return null;
@@ -653,7 +637,7 @@ test "dragging the globe with the mouse moves it immediately while dragging" {
     const clicked_coord = globe.raycastSphere(400 - gpos[0], 300 - gpos[1], gn.size.w, gn.size.h, fovy, state.distance, state.yaw, state.pitch).?;
 
     // Press mouse button in the center of the globe:
-    u.pointerButton(.{ 400, 300 }, ui.btn_left, true);
+    u.pointerButton(.{ 400, 300 }, .left, true);
     try testing.expect(state.is_dragging);
     try testing.expect(state.drag_anchor != null);
 
@@ -671,14 +655,14 @@ test "dragging the globe with the mouse moves it immediately while dragging" {
     try testing.expectApproxEqAbs(clicked_coord.lon, dragged_coord.lon, 0.05);
 
     // Release mouse button:
-    u.pointerButton(.{ 480, 340 }, ui.btn_left, false);
+    u.pointerButton(.{ 480, 340 }, .left, false);
     try testing.expect(!state.is_dragging);
 }
 
 test "dragging the globe with touch moves it immediately without cancelling press" {
-    const font_data = @import("font");
+    const font_data = kete.font;
     const f = try font_data.Font.init(@embedFile("FiraSans-Regular.ttf"));
-    const u = try ui.Ui.create(testing.allocator, &f);
+    const u = try kete.ui.WindowUi.create(testing.allocator, testing.io, &f);
     defer u.destroy();
 
     var state = Maps.State{};
@@ -686,7 +670,7 @@ test "dragging the globe with touch moves it immediately without cancelling pres
 
     const Root = struct {
         s: *Maps.State,
-        pub fn build(self: *const @This(), cx: *ui.Context) ui.Widget {
+        pub fn build(self: *const @This(), cx: *kete.BuildContext) kete.Widget {
             return (Maps{}).build(cx, self.s);
         }
     };
@@ -707,9 +691,9 @@ test "dragging the globe with touch moves it immediately without cancelling pres
 }
 
 test "zooming in transitions to the 50m resolution dataset and renders cleanly" {
-    const font_data = @import("font");
+    const font_data = kete.font;
     const f = try font_data.Font.init(@embedFile("FiraSans-Regular.ttf"));
-    const u = try ui.Ui.create(testing.allocator, &f);
+    const u = try kete.ui.WindowUi.create(testing.allocator, testing.io, &f);
     defer u.destroy();
 
     var state = Maps.State{};
@@ -717,7 +701,7 @@ test "zooming in transitions to the 50m resolution dataset and renders cleanly" 
 
     const Root = struct {
         s: *Maps.State,
-        pub fn build(self: *const @This(), cx: *ui.Context) ui.Widget {
+        pub fn build(self: *const @This(), cx: *kete.BuildContext) kete.Widget {
             return (Maps{}).build(cx, self.s);
         }
     };
@@ -729,7 +713,7 @@ test "zooming in transitions to the 50m resolution dataset and renders cleanly" 
     u.frame(800, 600, 0, Root{ .s = &state });
 
     const Check = struct {
-        fn none(n: *ui.Node) !void {
+        fn none(n: *kete.WidgetNode) !void {
             try testing.expect(!n.overflow.any());
             for (n.children.items) |ch| try none(ch);
         }
