@@ -64,12 +64,21 @@ fn run(init: std.process.Init) !void {
     // Where the frames' time goes, said every 10 s while frames are drawn
     // (when the globe turns or zooms): see `Timing`.
     var timing: Timing = .{ .since = sys.nowNs(), .waited_ns = app.window.gpu_waited_ns };
+    // And what the GPU does in them (on the Pi 0 to 3's).
+    var counting: app.gpu_counters.Counting = .{ .dev = host.dev };
+    counting.count(true);
+    defer counting.count(false);
     while (true) {
         const started = sys.nowNs();
         const going = try host.step(std.math.maxInt(u64));
         timing.add(sys.nowNs() - started, host.renderer.takeStats(), view.takeStats(), globe_gpu.stats);
         if (!going) return;
-        timing.reportEvery(10 * std.time.ns_per_s, app.window.gpu_waited_ns);
+        if (timing.reportEvery(10 * std.time.ns_per_s, app.window.gpu_waited_ns)) |frames| {
+            var counts: app.gpu_counters.Counting.Counts = undefined;
+            if (counting.take(&counts)) {
+                if (frames > 0) app.gpu_counters.report("dazzle-maps", &counts, frames);
+            }
+        }
     }
 }
 
@@ -104,11 +113,14 @@ const Timing = struct {
         t.overlays.high_detail = v.high_detail;
     }
 
-    fn reportEvery(t: *Timing, period_ns: u64, waited_ns: u64) void {
+    /// Says how the frames went, every `period_ns`: returns how many there
+    /// were then.
+    fn reportEvery(t: *Timing, period_ns: u64, waited_ns: u64) ?u32 {
         const now = sys.nowNs();
-        if (now - t.since < period_ns) return;
+        if (now - t.since < period_ns) return null;
+        const drawn = t.frames;
         defer t.* = .{ .since = now, .waited_ns = waited_ns };
-        if (t.frames == 0) return;
+        if (t.frames == 0) return 0;
         const n: f64 = @floatFromInt(t.frames);
         const ms = struct {
             fn per(ns: u64, frames: f64) f64 {
@@ -131,6 +143,7 @@ const Timing = struct {
             ms(t.gpu_ns, n),
             ms(waited_ns -% t.waited_ns, n),
         });
+        return drawn;
     }
 };
 
