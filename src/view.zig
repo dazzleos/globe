@@ -200,8 +200,8 @@ pub const GlobeView = struct {
         const corner = @sqrt(center_x * center_x + center_y * center_y);
 
         if (sphere_screen_r > 5 and sphere_screen_r < corner) {
-            bg_c.strokeCircle(.{ center_x, center_y }, sphere_screen_r * 1.035, sphere_screen_r * 0.035 + 1, gfx.Color.argb(0x1868b8f8));
-            bg_c.strokeCircle(.{ center_x, center_y }, sphere_screen_r * 1.015, sphere_screen_r * 0.015 + 1, gfx.Color.argb(0x2890d4ff));
+            glowRing(bg_c, .{ center_x, center_y }, sphere_screen_r, sphere_screen_r * 1.035, gfx.Color.argb(0x1868b8f8));
+            glowRing(bg_c, .{ center_x, center_y }, sphere_screen_r, sphere_screen_r * 1.015, gfx.Color.argb(0x2890d4ff));
         }
 
         // 2. 3D GPU Vector Globe (Ocean sphere + Natural Earth country polygons):
@@ -227,6 +227,22 @@ pub const GlobeView = struct {
         stats.paints += 1;
         stats.paint_ns += sys.nowNs() - started;
         stats.high_detail = self.state.distance <= detail_distance;
+    }
+
+    /// A ring round the globe, from `inner` to `outer` (radii, in pixels):
+    /// a polygon with a hole, whose triangles cover only the ring. (A
+    /// circle is drawn over its whole bounding square, shaded at every
+    /// pixel: bigger than the screen, zoomed in, twice over.)
+    fn glowRing(c: *gfx.Canvas, center: gfx.Point, inner: f32, outer: f32, color: gfx.Color) void {
+        const n = 160;
+        var out_pts: [n]gfx.Point = undefined;
+        var in_pts: [n]gfx.Point = undefined;
+        for (0..n) |i| {
+            const a = @as(f32, @floatFromInt(i)) * (2 * std.math.pi / @as(f32, n));
+            out_pts[i] = .{ center[0] + @cos(a) * outer, center[1] + @sin(a) * outer };
+            in_pts[i] = .{ center[0] + @cos(a) * inner, center[1] + @sin(a) * inner };
+        }
+        c.fillPath(&.{ &out_pts, &in_pts }, color);
     }
 
     fn drawGlobe(self: *const GlobeView, frame: *vc4.render.Frame, area: kete.gfx.GpuArea) anyerror!void {
@@ -756,3 +772,4 @@ test "zooming in transitions to the 50m resolution dataset and renders cleanly" 
     };
     try Check.none(u.root.?);
 }
+
