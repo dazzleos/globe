@@ -10,6 +10,7 @@ const font = kete.font;
 const vc4 = @import("vc4");
 const map_data = @import("map_data");
 const globe = @import("globe.zig");
+const sys = @import("sys");
 
 pub const min_size = [2]u32{ 640, 420 };
 pub const open_size = [2]u32{ 1024, 680 };
@@ -20,6 +21,23 @@ pub const label_color = gfx.Color.argb(0xff202834);
 pub const label_halo_color = gfx.Color.argb(0xd8ffffff);
 pub const geoline_label_color = gfx.Color.argb(0xff146c9c);
 pub const detail_distance: f32 = 2.0;
+
+/// What drawing the globe's overlays took since the app last took it
+/// (`takeStats`), for the log: the time painting them, the points
+/// projected (coastlines, borders, parallels) and the labels drawn.
+pub const Stats = struct {
+    paints: u32 = 0,
+    paint_ns: u64 = 0,
+    points: u64 = 0,
+    labels: u64 = 0,
+    high_detail: bool = false,
+};
+var stats: Stats = .{};
+
+pub fn takeStats() Stats {
+    defer stats = .{};
+    return stats;
+}
 
 pub const Maps = struct {
     globe_gpu: ?*globe.GlobeGpu = null,
@@ -202,7 +220,11 @@ pub const GlobeView = struct {
         // 3. Foreground overlay canvas (acquired AFTER p.gpuWith so coastlines,
         // borders, and country labels render ON TOP of the 3D GPU globe):
         const fg_c = p.canvas();
+        const started = sys.nowNs();
         self.paintOverlays(w, h, fg_c, p);
+        stats.paints += 1;
+        stats.paint_ns += sys.nowNs() - started;
+        stats.high_detail = self.state.distance <= detail_distance;
     }
 
     fn drawGlobe(self: *const GlobeView, frame: *vc4.render.Frame, area: kete.gfx.GpuArea) anyerror!void {
@@ -419,6 +441,7 @@ pub const GlobeView = struct {
                 placed_count += 1;
 
                 const baseline_y = ly + style.ascent();
+                stats.labels += 1;
                 // Crisp white halo behind dark label text:
                 _ = p.text(font_size, lx - 1, baseline_y, lbl.name, label_halo_color);
                 _ = p.text(font_size, lx + 1, baseline_y, lbl.name, label_halo_color);
@@ -441,6 +464,7 @@ pub const GlobeView = struct {
         color: gfx.Color,
     ) void {
         var pts: [128]gfx.Point = undefined;
+        for (spans) |sp| stats.points += sp.len;
         for (spans) |sp| {
             var count: usize = 0;
             const end = @min(@as(usize, sp.start) + @as(usize, sp.len), points.len);

@@ -59,8 +59,69 @@ fn run(init: std.process.Init) !void {
         .on_close_request = .close,
     });
 
-    while (try host.step(std.math.maxInt(u64))) {}
+    // Where the frames' time goes, said every 10 s while frames are drawn
+    // (when the globe turns or zooms): see `Timing`.
+    var timing: Timing = .{ .since = sys.nowNs() };
+    while (true) {
+        const started = sys.nowNs();
+        const going = try host.step(std.math.maxInt(u64));
+        timing.add(sys.nowNs() - started, host.renderer.takeStats(), view.takeStats());
+        if (!going) return;
+        timing.reportEvery(10 * std.time.ns_per_s);
+    }
 }
+
+/// The frames' time: kete's step (laying out and painting the window,
+/// recording the frame's draws, waiting for the GPU to draw it and for the
+/// shell to take it), and of that, the overlays' painting (projecting
+/// coastlines, borders and labels, on the CPU), the recording, and the
+/// GPU's time (frames are waited for).
+const Timing = struct {
+    since: u64,
+    frames: u32 = 0,
+    step_ns: u64 = 0,
+    record_ns: u64 = 0,
+    gpu_ns: u64 = 0,
+    overlays: view.Stats = .{},
+
+    fn add(t: *Timing, step_ns: u64, r: kete_vc4.renderer.Stats, v: view.Stats) void {
+        if (r.frames == 0) return;
+        t.frames += r.frames;
+        t.step_ns += step_ns;
+        t.record_ns += r.cpu_ns;
+        t.gpu_ns += r.gpu_ns;
+        t.overlays.paints += v.paints;
+        t.overlays.paint_ns += v.paint_ns;
+        t.overlays.points += v.points;
+        t.overlays.labels += v.labels;
+        t.overlays.high_detail = v.high_detail;
+    }
+
+    fn reportEvery(t: *Timing, period_ns: u64) void {
+        const now = sys.nowNs();
+        if (now - t.since < period_ns) return;
+        defer t.* = .{ .since = now };
+        if (t.frames == 0) return;
+        const n: f64 = @floatFromInt(t.frames);
+        const ms = struct {
+            fn per(ns: u64, frames: f64) f64 {
+                return @as(f64, @floatFromInt(ns)) / std.time.ns_per_ms / frames;
+            }
+        }.per;
+        const p: f64 = @floatFromInt(@max(t.overlays.paints, 1));
+        print("dazzle-maps: {d} frames ({d:.1} a second), {s} detail; per frame: step {d:.1} ms (overlays painted {d:.1} ms: {d:.0} points, {d:.0} labels; recording {d:.1} ms; GPU {d:.1} ms)\n", .{
+            t.frames,
+            n / (@as(f64, @floatFromInt(now - t.since)) / std.time.ns_per_s),
+            if (t.overlays.high_detail) "high" else "low",
+            ms(t.step_ns, n),
+            ms(t.overlays.paint_ns, p),
+            @as(f64, @floatFromInt(t.overlays.points)) / p,
+            @as(f64, @floatFromInt(t.overlays.labels)) / p,
+            ms(t.record_ns, n),
+            ms(t.gpu_ns, n),
+        });
+    }
+};
 
 test {
     _ = map_data;
