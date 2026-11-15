@@ -187,19 +187,21 @@ pub const GlobeView = struct {
         const h = n.size.h;
         if (w <= 1 or h <= 1) return;
 
-        // 1. Background canvas (rendered BEFORE the 3D GPU globe):
+        // 1. Background canvas (rendered BEFORE the 3D GPU globe). Space is
+        // the window's clear colour; round the globe, a glow: rings (only
+        // they show, round its edge), and none once they are off the
+        // screen (zoomed in).
         const bg_c = p.canvas();
-        bg_c.fillRect(.{ .x = 0, .y = 0, .w = w, .h = h }, gfx.Color.rgb(0x0b101b));
-
         const fovy = 45.0 * (std.math.pi / 180.0);
         const tan_fov = @tan(fovy * 0.5);
         const sphere_screen_r = (h * 0.5) / (tan_fov * self.state.distance);
         const center_x = w * 0.5;
         const center_y = h * 0.5;
+        const corner = @sqrt(center_x * center_x + center_y * center_y);
 
-        if (sphere_screen_r > 5) {
-            bg_c.fillCircle(.{ center_x, center_y }, sphere_screen_r * 1.035, gfx.Color.argb(0x1868b8f8));
-            bg_c.fillCircle(.{ center_x, center_y }, sphere_screen_r * 1.015, gfx.Color.argb(0x2890d4ff));
+        if (sphere_screen_r > 5 and sphere_screen_r < corner) {
+            bg_c.strokeCircle(.{ center_x, center_y }, sphere_screen_r * 1.035, sphere_screen_r * 0.035 + 1, gfx.Color.argb(0x1868b8f8));
+            bg_c.strokeCircle(.{ center_x, center_y }, sphere_screen_r * 1.015, sphere_screen_r * 0.015 + 1, gfx.Color.argb(0x2890d4ff));
         }
 
         // 2. 3D GPU Vector Globe (Ocean sphere + Natural Earth country polygons):
