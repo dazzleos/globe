@@ -321,7 +321,14 @@ pub const GlobeView = struct {
             }
         }
 
-        // 2. Coastlines (#198EC8 from MapLibre globe style):
+        // 2. Coastlines (#198EC8 from MapLibre globe style), borders and the
+        // parallels: drawn by the GPU with the globe, when there is one
+        // (see shaders/globe_lines.zig); here otherwise.
+        if (self.maps.globe_gpu == null) self.paintLines(w, h, c, mvp, cam_model, high_detail);
+        self.paintLabels(w, h, p, mvp, cam_model);
+    }
+
+    fn paintLines(_: *const GlobeView, w: f32, h: f32, c: *gfx.Canvas, mvp: globe.Mat4, cam_model: [3]f32, high_detail: bool) void {
         const coast_col = gfx.Color.argb(map_data.coastline_color);
         if (high_detail) {
             drawProjectedSpans(c, &map_data.coastline_50m_points, &map_data.coastline_50m_spans, mvp, cam_model, w, h, 1.2, coast_col);
@@ -343,7 +350,10 @@ pub const GlobeView = struct {
         drawParallel(c, -23.4368, true, 1.1, gfx.Color.argb(0x88198EC8), mvp, cam_model, w, h);
         drawParallel(c, 66.5632, true, 1.0, gfx.Color.argb(0x70198EC8), mvp, cam_model, w, h);
         drawParallel(c, -66.5632, true, 1.0, gfx.Color.argb(0x70198EC8), mvp, cam_model, w, h);
+    }
 
+    fn paintLabels(self: *const GlobeView, w: f32, h: f32, p: *kete.Painter, mvp: globe.Mat4, cam_model: [3]f32) void {
+        const high_detail = self.state.distance <= detail_distance;
         // 5. Country & Geoline Labels (decluttered by zoom level and screen-space bounding boxes):
         const max_rank: u8 = if (self.state.distance > 3.0)
             2

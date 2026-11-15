@@ -11,6 +11,7 @@ const sys = @import("sys");
 const kete = @import("kete");
 const kete_vc4 = @import("kete_vc4");
 const build_info = @import("build_info");
+const app = @import("app");
 
 const map_data = @import("map_data");
 const globe = @import("globe.zig");
@@ -43,7 +44,8 @@ const Root = struct {
 fn run(init: std.process.Init) !void {
     const gpa = std.heap.page_allocator;
     var host: kete_vc4.Host = undefined;
-    try host.init(gpa, init.io, init.minimal.environ, .{ .app_id = "dazzle-maps" });
+    // Frames are left with the GPU: the next is made while it draws one.
+    try host.init(gpa, init.io, init.minimal.environ, .{ .app_id = "dazzle-maps", .pipelined = true });
     defer host.deinit();
 
     var globe_gpu = try globe.GlobeGpu.init(gpa, host.dev);
@@ -61,31 +63,36 @@ fn run(init: std.process.Init) !void {
 
     // Where the frames' time goes, said every 10 s while frames are drawn
     // (when the globe turns or zooms): see `Timing`.
-    var timing: Timing = .{ .since = sys.nowNs() };
+    var timing: Timing = .{ .since = sys.nowNs(), .waited_ns = app.window.gpu_waited_ns };
     while (true) {
         const started = sys.nowNs();
         const going = try host.step(std.math.maxInt(u64));
-        timing.add(sys.nowNs() - started, host.renderer.takeStats(), view.takeStats());
+        timing.add(sys.nowNs() - started, host.renderer.takeStats(), view.takeStats(), globe_gpu.stats);
         if (!going) return;
-        timing.reportEvery(10 * std.time.ns_per_s);
+        timing.reportEvery(10 * std.time.ns_per_s, app.window.gpu_waited_ns);
     }
 }
 
 /// The frames' time: kete's step (laying out and painting the window,
 /// recording the frame's draws, waiting for the GPU to draw it and for the
 /// shell to take it), and of that, the overlays' painting (projecting
-/// coastlines, borders and labels, on the CPU), the recording, and the
-/// GPU's time (frames are waited for).
+/// labels, on the CPU), the recording, handing the frame to the GPU, and
+/// waiting for it (frames are pipelined: the next is made while the GPU
+/// draws one, which is waited for only if it has not finished by then).
 const Timing = struct {
     since: u64,
+    /// `app.window.gpu_waited_ns` when this began.
+    waited_ns: u64,
     frames: u32 = 0,
     step_ns: u64 = 0,
     record_ns: u64 = 0,
     gpu_ns: u64 = 0,
     overlays: view.Stats = .{},
+    globe: globe.DrawStats = .{},
 
-    fn add(t: *Timing, step_ns: u64, r: kete_vc4.renderer.Stats, v: view.Stats) void {
+    fn add(t: *Timing, step_ns: u64, r: kete_vc4.renderer.Stats, v: view.Stats, g: globe.DrawStats) void {
         if (r.frames == 0) return;
+        t.globe = g;
         t.frames += r.frames;
         t.step_ns += step_ns;
         t.record_ns += r.cpu_ns;
@@ -97,10 +104,10 @@ const Timing = struct {
         t.overlays.high_detail = v.high_detail;
     }
 
-    fn reportEvery(t: *Timing, period_ns: u64) void {
+    fn reportEvery(t: *Timing, period_ns: u64, waited_ns: u64) void {
         const now = sys.nowNs();
         if (now - t.since < period_ns) return;
-        defer t.* = .{ .since = now };
+        defer t.* = .{ .since = now, .waited_ns = waited_ns };
         if (t.frames == 0) return;
         const n: f64 = @floatFromInt(t.frames);
         const ms = struct {
@@ -109,16 +116,20 @@ const Timing = struct {
             }
         }.per;
         const p: f64 = @floatFromInt(@max(t.overlays.paints, 1));
-        print("dazzle-maps: {d} frames ({d:.1} a second), {s} detail; per frame: step {d:.1} ms (overlays painted {d:.1} ms: {d:.0} points, {d:.0} labels; recording {d:.1} ms; GPU {d:.1} ms)\n", .{
+        print("dazzle-maps: {d} frames ({d:.1} a second), {s} detail, {d} cells ({d} draws, {d}k triangles); per frame: step {d:.1} ms (overlays painted {d:.1} ms: {d:.0} points, {d:.0} labels; recording {d:.1} ms, handing over {d:.1} ms, waiting for the GPU {d:.1} ms)\n", .{
             t.frames,
             n / (@as(f64, @floatFromInt(now - t.since)) / std.time.ns_per_s),
             if (t.overlays.high_detail) "high" else "low",
+            t.globe.cells,
+            t.globe.draws,
+            t.globe.triangles / 1000,
             ms(t.step_ns, n),
             ms(t.overlays.paint_ns, p),
             @as(f64, @floatFromInt(t.overlays.points)) / p,
             @as(f64, @floatFromInt(t.overlays.labels)) / p,
             ms(t.record_ns, n),
             ms(t.gpu_ns, n),
+            ms(waited_ns -% t.waited_ns, n),
         });
     }
 };
