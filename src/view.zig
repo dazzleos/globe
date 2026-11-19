@@ -1,4 +1,4 @@
-//! The Maps window, as widgets: a clean, interactive 3D political globe
+//! The Globe window, as widgets: a clean, interactive 3D political globe
 //! rendered with Natural Earth vectors, MapLibre globe colors, country
 //! boundaries, coastlines, and labels, with a top-right fullscreen toggle.
 
@@ -39,7 +39,7 @@ pub fn takeStats() Stats {
     return stats;
 }
 
-pub const Maps = struct {
+pub const Globe = struct {
     globe_gpu: ?*globe.GlobeGpu = null,
     /// Full screen or not (the window's own, if null).
     on_fullscreen: ?kete.Callback = null,
@@ -66,7 +66,7 @@ pub const Maps = struct {
         }
     };
 
-    pub fn build(self: *const Maps, cx: *kete.BuildContext, state: *State) kete.Widget {
+    pub fn build(self: *const Globe, cx: *kete.BuildContext, state: *State) kete.Widget {
         const now = cx.now();
         const dt = if (state.last_frame_ns) |last|
             @as(f32, @floatFromInt(now -| last)) / @as(f32, @floatFromInt(std.time.ns_per_s))
@@ -95,7 +95,7 @@ pub const Maps = struct {
 
         // 1. 3D Political Vector Globe (fills background, clipped to bounds)
         layers.append(a, cx.make(GlobeView{
-            .maps = self,
+            .app = self,
             .state = state,
         })) catch {};
 
@@ -174,8 +174,8 @@ pub const Maps = struct {
 pub const GlobeView = struct {
     pub const clips_children = true;
 
-    maps: *const Maps,
-    state: *Maps.State,
+    app: *const Globe,
+    state: *Globe.State,
 
     pub fn layout(self: *const GlobeView, _: *kete.WidgetNode, c: kete.Constraints) kete.Size {
         _ = self;
@@ -205,7 +205,7 @@ pub const GlobeView = struct {
         }
 
         // 2. 3D GPU Vector Globe (Ocean sphere + Natural Earth country polygons):
-        if (self.maps.globe_gpu) |_| {
+        if (self.app.globe_gpu) |_| {
             var key = std.hash.Wyhash.init(0);
             key.update(std.mem.asBytes(&self.state.yaw));
             key.update(std.mem.asBytes(&self.state.pitch));
@@ -271,7 +271,7 @@ pub const GlobeView = struct {
 
         const sun_dir = [3]f32{ -0.4, 0.3, 0.85 };
 
-        try self.maps.globe_gpu.?.draw(
+        try self.app.globe_gpu.?.draw(
             frame,
             vp,
             if (area.scissor) |sc| kete_vc4.renderer.viewport(sc) else null,
@@ -310,7 +310,7 @@ pub const GlobeView = struct {
 
         // 1. In CPU-only preview mode (no GPU), draw 2D projected country polygons
         // so unit tests and CPU previews show the political map as well:
-        if (self.maps.globe_gpu == null) {
+        if (self.app.globe_gpu == null) {
             const verts = if (high_detail) &map_data.country_50m_vertices else &map_data.country_vertices;
             const idxs = if (high_detail) &map_data.country_50m_indices else &map_data.country_indices;
             const batches = if (high_detail) &map_data.country_50m_batches else &map_data.country_batches;
@@ -342,7 +342,7 @@ pub const GlobeView = struct {
         // 2. Coastlines (#198EC8 from MapLibre globe style), borders and the
         // parallels: drawn by the GPU with the globe, when there is one
         // (see shaders/globe_lines.zig); here otherwise.
-        if (self.maps.globe_gpu == null) self.paintLines(w, h, c, mvp, cam_model, high_detail);
+        if (self.app.globe_gpu == null) self.paintLines(w, h, c, mvp, cam_model, high_detail);
         self.paintLabels(w, h, p, mvp, cam_model);
     }
 
@@ -632,7 +632,7 @@ pub const GlobeView = struct {
 
 const testing = std.testing;
 
-test "Maps view fits from smallest window to biggest without overflowing" {
+test "Globe view fits from smallest window to biggest without overflowing" {
     const font_data = kete.font;
     const f = try font_data.Font.init(@embedFile("FiraSans-Regular.ttf"));
     const u = try kete.ui.WindowUi.create(testing.allocator, testing.io, &f);
@@ -644,7 +644,7 @@ test "Maps view fits from smallest window to biggest without overflowing" {
         .{ 1280, 720 },
         .{ 1920, 1080 },
     }) |size| {
-        u.frame(size[0], size[1], 0, Maps{
+        u.frame(size[0], size[1], 0, Globe{
             .globe_gpu = null,
         });
         const Check = struct {
@@ -663,14 +663,14 @@ test "dragging the globe with the mouse moves it immediately while dragging" {
     const u = try kete.ui.WindowUi.create(testing.allocator, testing.io, &f);
     defer u.destroy();
 
-    var state = Maps.State{};
+    var state = Globe.State{};
     const init_yaw = state.yaw;
     const init_pitch = state.pitch;
 
     const Root = struct {
-        s: *Maps.State,
+        s: *Globe.State,
         pub fn build(self: *const @This(), cx: *kete.BuildContext) kete.Widget {
-            return (Maps{}).build(cx, self.s);
+            return (Globe{}).build(cx, self.s);
         }
     };
 
@@ -717,13 +717,13 @@ test "dragging the globe with touch moves it immediately without cancelling pres
     const u = try kete.ui.WindowUi.create(testing.allocator, testing.io, &f);
     defer u.destroy();
 
-    var state = Maps.State{};
+    var state = Globe.State{};
     const init_yaw = state.yaw;
 
     const Root = struct {
-        s: *Maps.State,
+        s: *Globe.State,
         pub fn build(self: *const @This(), cx: *kete.BuildContext) kete.Widget {
-            return (Maps{}).build(cx, self.s);
+            return (Globe{}).build(cx, self.s);
         }
     };
 
@@ -748,13 +748,13 @@ test "zooming in transitions to the 50m resolution dataset and renders cleanly" 
     const u = try kete.ui.WindowUi.create(testing.allocator, testing.io, &f);
     defer u.destroy();
 
-    var state = Maps.State{};
+    var state = Globe.State{};
     try testing.expect(state.distance > detail_distance);
 
     const Root = struct {
-        s: *Maps.State,
+        s: *Globe.State,
         pub fn build(self: *const @This(), cx: *kete.BuildContext) kete.Widget {
-            return (Maps{}).build(cx, self.s);
+            return (Globe{}).build(cx, self.s);
         }
     };
 

@@ -1,4 +1,4 @@
-//! Makes the Maps app's embedded Natural Earth vector dataset (`map_data.zig`)
+//! Makes the Globe app's embedded Natural Earth vector dataset (`map_data.zig`)
 //! from Natural Earth's 110m Admin-0 Countries GeoJSON (`ne_110m_admin_0_countries.geojson`).
 //!
 //!     mkmap <ne_110m_admin_0_countries.geojson> <map_data.zig>

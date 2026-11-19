@@ -1,4 +1,4 @@
-//! Maps: an interactive 3D political globe application for Dazzle, showing
+//! Globe: an interactive 3D political globe application for Dazzle, showing
 //! the Earth rendered with embedded Natural Earth vectors.
 //!
 //!     dazzle-maps
@@ -23,7 +23,7 @@ const background = 0xff0b101b;
 
 pub fn main(init: std.process.Init) u8 {
     sys.logToKmsgIfStderr();
-    print("dazzle: maps (build {s}) running as uid {d}\n", .{ build_info.commit, linux.getuid() });
+    print("dazzle: globe (build {s}) running as uid {d}\n", .{ build_info.commit, linux.getuid() });
 
     run(init) catch |err| {
         print(sys.log_error ++ "dazzle-maps: error: {s}\n", .{@errorName(err)});
@@ -37,7 +37,7 @@ const Root = struct {
     globe_gpu: *globe.GlobeGpu,
 
     pub fn build(r: *const Root, cx: *kete.BuildContext) kete.Widget {
-        return cx.make(view.Maps{ .globe_gpu = r.globe_gpu });
+        return cx.make(view.Globe{ .globe_gpu = r.globe_gpu });
     }
 };
 
@@ -53,7 +53,7 @@ fn run(init: std.process.Init) !void {
 
     const root: Root = .{ .globe_gpu = &globe_gpu };
     _ = try host.app.openWindow(.{
-        .title = "Maps",
+        .title = "Globe",
         .root = .of(&root),
         .size = view.open_size,
         .min_size = view.min_size,
