@@ -1,0 +1,22 @@
+.{
+    .name = .globe,
+    .version = "0.0.0",
+    .fingerprint = 0xb558041453c999c3, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        // Dazzle's modules (kete_vc4 and the rest) and tools, which
+        // Globe is built with. To build with a Dazzle checkout beside it
+        // instead: `zig build --fork=../dazzle`.
+        .dazzle = .{
+            .url = "git+https://github.com/dazzleos/dazzle#056e3e6ec7c7ccb933e291b6e7a68b216669313e",
+            .hash = "dazzle-0.0.0-ze61IH8jzAC6yEaMr1VfENiCxPxvGvNNOSy4s0AxFnsS",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "tools",
+        "LICENSE",
+    },
+}
