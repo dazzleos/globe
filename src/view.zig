@@ -64,6 +64,13 @@ pub const Globe = struct {
         pub fn zoomOut(s: *State) void {
             s.distance = @min(s.distance * 1.14, 4.8);
         }
+
+        /// Two fingers `scale` times further apart: as much closer (the
+        /// globe as much bigger), within the zooms the wheel goes to.
+        pub fn pinch(s: *State, scale: f32) void {
+            if (!(scale > 0)) return;
+            s.distance = std.math.clamp(s.distance / scale, 1.30, 4.8);
+        }
     };
 
     pub fn build(self: *const Globe, cx: *kete.BuildContext, state: *State) kete.Widget {
@@ -624,6 +631,15 @@ pub const GlobeView = struct {
                 n.ui.needs_frame = true;
                 return true;
             },
+            // Two fingers apart or together: zoomed in or out (it stops
+            // turning: the first finger's press was taken back).
+            .pinch => |p| {
+                self.state.drag_vel_x = 0;
+                self.state.drag_vel_y = 0;
+                self.state.pinch(p.scale);
+                n.ui.needs_frame = true;
+                return true;
+            },
             else => {},
         }
         return false;
@@ -740,6 +756,35 @@ test "dragging the globe with touch moves it immediately without cancelling pres
 
     u.touchUp(1);
     try testing.expect(!state.is_dragging);
+}
+
+test "two fingers pinch the globe bigger or smaller" {
+    const font_data = kete.font;
+    const f = try font_data.Font.init(@embedFile("FiraSans-Regular.ttf"));
+    const u = try kete.ui.WindowUi.create(testing.allocator, testing.io, &f);
+    defer u.destroy();
+    var state = Globe.State{};
+    const Root = struct {
+        s: *Globe.State,
+        pub fn build(self: *const @This(), cx: *kete.BuildContext) kete.Widget {
+            return (Globe{}).build(cx, self.s);
+        }
+    };
+    u.frame(800, 600, 0, Root{ .s = &state });
+    const start = state.distance;
+    // Apart, to half as far again: two thirds as far away.
+    u.touchDown(1, .{ 350, 300 });
+    u.touchDown(2, .{ 450, 300 });
+    u.touchMotion(1, .{ 325, 300 });
+    u.touchMotion(2, .{ 475, 300 });
+    try testing.expectApproxEqAbs(start / 1.5, state.distance, 0.01);
+    try testing.expect(!state.is_dragging);
+    // Together, a long way: no further out than the wheel goes.
+    u.touchMotion(1, .{ 395, 300 });
+    u.touchMotion(2, .{ 405, 300 });
+    try testing.expectEqual(@as(f32, 4.8), state.distance);
+    u.touchUp(2);
+    u.touchUp(1);
 }
 
 test "zooming in transitions to the 50m resolution dataset and renders cleanly" {
