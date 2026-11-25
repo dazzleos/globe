@@ -318,7 +318,96 @@ fn jsonString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     };
 }
 
-fn buildDataset(arena: std.mem.Allocator, geojson_bytes: []const u8) !LodDataset {
+/// Each country's colour (its index in `country_palette`), by ADM0_A3, so
+/// that no two countries sharing a border (an edge of their outlines, in
+/// any of `datasets`) have the same one: the colour MapLibre gives it
+/// (`getCountryColorIdx`) where none of its neighbours has that, otherwise
+/// the first free one. Countries are coloured most constrained first
+/// (DSatur), which a map's few colours always suffice for here.
+pub fn countryColors(arena: std.mem.Allocator, datasets: []const []const u8) !std.StringHashMapUnmanaged(u8) {
+    var ids: std.StringHashMapUnmanaged(u16) = .empty;
+    var names: std.ArrayList([]const u8) = .empty;
+    var owner: std.AutoHashMapUnmanaged(EdgeKey, u16) = .empty;
+    var pairs: std.AutoHashMapUnmanaged([2]u16, void) = .empty;
+    for (datasets) |bytes| {
+        owner.clearRetainingCapacity();
+        const parsed = try std.json.parseFromSlice(std.json.Value, arena, bytes, .{});
+        for (parsed.value.object.get("features").?.array.items) |feat_val| {
+            const feat = feat_val.object;
+            const props = feat.get("properties").?.object;
+            const adm0 = jsonString(props, "ADM0_A3") orelse jsonString(props, "ISO_A3") orelse continue;
+            const gop = try ids.getOrPut(arena, adm0);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = @intCast(names.items.len);
+                try names.append(arena, adm0);
+            }
+            const id = gop.value_ptr.*;
+            const geom = feat.get("geometry").?.object;
+            const coords = geom.get("coordinates").?.array.items;
+            // A MultiPolygon's polygons, or a Polygon (its rings).
+            const multi = std.mem.eql(u8, geom.get("type").?.string, "MultiPolygon");
+            for (0..if (multi) coords.len else 1) |pi| for (if (multi) coords[pi].array.items else coords) |ring| {
+                var prev: ?QuantPt = null;
+                for (ring.array.items) |pt| {
+                    const pair = pt.array.items;
+                    if (pair.len < 2) continue;
+                    const q = quantPt(jsonNumber(pair[0]) orelse continue, jsonNumber(pair[1]) orelse continue);
+                    if (prev) |p| if (p[0] != q[0] or p[1] != q[1]) {
+                        const e = try owner.getOrPut(arena, EdgeKey.make(p, q));
+                        if (!e.found_existing) {
+                            e.value_ptr.* = id;
+                        } else if (e.value_ptr.* != id) {
+                            const o = e.value_ptr.*;
+                            try pairs.put(arena, .{ @min(o, id), @max(o, id) }, {});
+                        }
+                    };
+                    prev = q;
+                }
+            };
+        }
+    }
+    const n = names.items.len;
+    const neighbours = try arena.alloc(std.ArrayList(u16), n);
+    for (neighbours) |*l| l.* = .empty;
+    var it = pairs.keyIterator();
+    while (it.next()) |pr| {
+        try neighbours[pr[0]].append(arena, pr[1]);
+        try neighbours[pr[1]].append(arena, pr[0]);
+    }
+    const colour = try arena.alloc(?u8, n);
+    @memset(colour, null);
+    for (0..n) |_| {
+        // The uncoloured country with the most differently coloured
+        // neighbours (then the most neighbours).
+        var best: ?usize = null;
+        var best_sat: usize = 0;
+        for (0..n) |c| if (colour[c] == null) {
+            var seen: u8 = 0;
+            for (neighbours[c].items) |nb| if (colour[nb]) |k| {
+                seen |= @as(u8, 1) << @intCast(k);
+            };
+            const sat: usize = @popCount(seen);
+            if (best == null or sat > best_sat or (sat == best_sat and neighbours[c].items.len > neighbours[best.?].items.len)) {
+                best = c;
+                best_sat = sat;
+            }
+        };
+        const c = best.?;
+        var used: u8 = 0;
+        for (neighbours[c].items) |nb| if (colour[nb]) |k| {
+            used |= @as(u8, 1) << @intCast(k);
+        };
+        const preferred = getCountryColorIdx(names.items[c]);
+        colour[c] = if (used & (@as(u8, 1) << @intCast(preferred)) == 0) preferred else for (0..country_palette.len) |k| {
+            if (used & (@as(u8, 1) << @intCast(k)) == 0) break @intCast(k);
+        } else return error.TooFewColours;
+    }
+    var out: std.StringHashMapUnmanaged(u8) = .empty;
+    for (names.items, colour) |name, k| try out.put(arena, name, k.?);
+    return out;
+}
+
+fn buildDataset(arena: std.mem.Allocator, geojson_bytes: []const u8, colours: *const std.StringHashMapUnmanaged(u8)) !LodDataset {
     const parsed = try std.json.parseFromSlice(std.json.Value, arena, geojson_bytes, .{});
     const root = parsed.value.object;
     const features = root.get("features").?.array.items;
@@ -345,7 +434,7 @@ fn buildDataset(arena: std.mem.Allocator, geojson_bytes: []const u8) !LodDataset
             @intFromFloat(std.math.clamp(jsonNumber(v) orelse 5.0, 1.0, 10.0))
         else
             5;
-        const color_idx = getCountryColorIdx(adm0);
+        const color_idx = colours.get(adm0) orelse getCountryColorIdx(adm0);
 
         if (name.len > 0 and !std.mem.eql(u8, adm0, "ATA")) {
             try labels.append(arena, .{
@@ -578,11 +667,14 @@ pub fn generate(arena: std.mem.Allocator, geojson_110m: []const u8) ![]u8 {
 }
 
 pub fn generateTwoLod(arena: std.mem.Allocator, geojson_110m: []const u8, geojson_50m: []const u8) ![]u8 {
-    const lod_110m = try buildDataset(arena, geojson_110m);
+    // One colouring for both, so a country keeps its colour as the
+    // detail changes.
+    const colours = try countryColors(arena, &.{ geojson_110m, geojson_50m });
+    const lod_110m = try buildDataset(arena, geojson_110m, &colours);
     const lod_50m = if (geojson_50m.ptr == geojson_110m.ptr and geojson_50m.len == geojson_110m.len)
         lod_110m
     else
-        try buildDataset(arena, geojson_50m);
+        try buildDataset(arena, geojson_50m, &colours);
 
     var out: std.ArrayList(u8) = .empty;
     try out.appendSlice(arena,
@@ -767,4 +859,26 @@ test "mkmap triangulates GeoJSON polygon and classifies shared borders vs coastl
     try std.testing.expect(std.mem.indexOf(u8, code, "pub const border_spans = [1]LineSpan") != null);
     try std.testing.expect(std.mem.indexOf(u8, code, ".name = \"France\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, code, ".name = \"Spain\"") != null);
+}
+
+test "neighbouring countries never share a colour; others keep MapLibre's" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // ARM and ATG (both MapLibre's first colour) share an edge; MNE (also
+    // the first) borders neither.
+    const geojson =
+        \\{ "type": "FeatureCollection", "features": [
+        \\  { "type": "Feature", "properties": { "ADM0_A3": "ARM" }, "geometry": { "type": "Polygon",
+        \\    "coordinates": [[[0, 0], [5, 0], [5, 5], [0, 5], [0, 0]]] } },
+        \\  { "type": "Feature", "properties": { "ADM0_A3": "ATG" }, "geometry": { "type": "MultiPolygon",
+        \\    "coordinates": [[[[5, 0], [10, 0], [10, 5], [5, 5], [5, 0]]]] } },
+        \\  { "type": "Feature", "properties": { "ADM0_A3": "MNE" }, "geometry": { "type": "Polygon",
+        \\    "coordinates": [[[20, 20], [25, 20], [25, 25], [20, 25], [20, 20]]] } }
+        \\] }
+    ;
+    try std.testing.expectEqual(getCountryColorIdx("ARM"), getCountryColorIdx("ATG"));
+    const colours = try countryColors(arena, &.{geojson});
+    try std.testing.expect(colours.get("ARM").? != colours.get("ATG").?);
+    try std.testing.expectEqual(getCountryColorIdx("MNE"), colours.get("MNE").?);
 }
